@@ -1,0 +1,18 @@
+# One app container (API + web UI) and one Postgres. Set JWT_SECRET in your environment or a .env file.
+services:
+  app:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://bms:bms@db:5432/bms
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (openssl rand -hex 32)}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    depends_on:
+      db: { condition: service_healthy }
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: bms, POSTGRES_PASSWORD: bms, POSTGRES_DB: bms }
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U bms"], interval: 5s, retries: 10 }
+volumes:
+  pgdata:

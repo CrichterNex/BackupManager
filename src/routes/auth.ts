@@ -77,7 +77,7 @@ meRouter.get('/', (req, res) => {
     success: true,
     data: {
       id: s.user_id, username: s.username, email: s.email, first_name: s.first_name, last_name: s.last_name,
-      company_id: s.company_id, company_name: s.company_name, role: s.role,
+      company_id: s.company_id, company_name: s.company_name, company_slug: s.company_slug, role: s.role,
     },
   });
 });
