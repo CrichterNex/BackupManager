@@ -176,15 +176,41 @@ async function serverDetail(s) {
       row('Health', badge(full.status)), row('OS', label(full.os_type)), row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
       row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
       row('Last backup', `${label(full.last_backup_status)} · ${fmtDate(full.last_backup_time)}`), row('Last test', `${label(full.last_test_status)} · ${fmtDate(full.last_test_time)}`),
-      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), row('Notes', full.notes ?? '—'))),
+      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), row('Agent', agentSummary(full.agent)), row('Notes', full.notes ?? '—'))),
     h('div', { class: 'actions' },
       isAdmin() && h('button', { class: 'danger', onclick: async () => {
         if (await confirmModal('Delete server?', `${full.hostname} and its backup jobs will be removed from view. History is kept for audit.`, 'Delete')) {
           overlay.remove(); if (await act(() => api('DELETE', `/servers/${full.id}`), 'Server deleted')) show();
         } } }, 'Delete'),
+      isAdmin() && (full.agent.enrolled
+        ? h('button', { onclick: async () => { if (await confirmModal('Remove agent?', `${full.hostname} will stop receiving backup and test commands. The agent software on the server keeps running until you stop it.`, 'Remove') && await act(() => api('DELETE', `/servers/${full.id}/agent`), 'Agent removed')) { overlay.remove(); show(); } } }, 'Remove agent')
+        : h('button', { onclick: () => { overlay.remove(); enrollAgent(full); } }, 'Enroll agent')),
       isAdmin() && h('button', { onclick: async () => { overlay.remove(); await assignForm(full, techs, assigned); } }, 'Assign technicians'),
       isAdmin() && h('button', { onclick: () => { overlay.remove(); serverForm(full); } }, 'Edit'),
       h('button', { class: 'primary', onclick: () => overlay.remove() }, 'Close'))));
+  document.body.append(overlay);
+}
+const agentSummary = (a) => {
+  if (!a.enrolled) return 'Not enrolled';
+  const actions = Object.keys(a.actions ?? {});
+  return h('span', {}, badge(a.online ? 'success' : 'failed', a.online ? 'Online' : 'Offline'), ` last seen ${fmtAgo(a.last_seen_at)}`,
+    a.agent_version ? ` · v${a.agent_version}` : '', actions.length ? ` · actions: ${actions.join(', ')}` : ' · no actions reported yet');
+};
+async function enrollAgent(server) {
+  let r;
+  try { r = await api('POST', `/servers/${server.id}/agent`); } catch (e) { return toast(errMessage(e), true); }
+  const config = JSON.stringify({
+    bms_url: r.agent_config.bms_url, token: r.agent_config.token, poll_seconds: 30,
+    actions: {
+      backup: { type: 'command', command: ['/path/to/your-backup-script'], timeout_seconds: 7200 },
+      'restore-test': { type: 'restore_test', path: '/path/to/backups' },
+    },
+  }, null, 2);
+  const overlay = h('div', { class: 'overlay' }, h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' },
+    h('h2', {}, `Agent enrolled for ${server.hostname}`),
+    h('p', {}, 'Copy this into the agent’s config file on that server and edit the two paths. The secret is shown only once. If you lose it, remove the agent and enroll again.'),
+    h('pre', { style: 'white-space:pre-wrap;word-break:break-all;background:rgba(127,127,127,.15);padding:10px;border-radius:6px;font-size:12px' }, config),
+    h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => { overlay.remove(); show(); } }, 'I have copied it'))));
   document.body.append(overlay);
 }
 async function assignForm(server, techs, assigned) {
@@ -207,6 +233,7 @@ async function backups() {
     { title: 'Size', render: (j) => (j.size_gb != null ? `${j.size_gb} GB` : '—') }, { title: 'Last run', render: (j) => fmtAgo(j.completed_time) },
     { title: 'Tested', render: (j) => (j.test_status ? badge(j.test_status) : '—') },
     { title: '', render: (j) => h('span', { class: 'row' },
+      isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await act(() => api('POST', `/backup-jobs/${j.id}/run`), 'Backup started. The agent picks it up within a minute.')) show(); } }, 'Run now'),
       canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); runTest(j); } }, 'Run test'),
       isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); setStatus(j); } }, 'Update status'),
       isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await confirmModal('Delete backup job?', `${j.hostname} / ${label(j.backup_method)}`, 'Delete') && await act(() => api('DELETE', `/backup-jobs/${j.id}`), 'Job deleted')) show(); } }, 'Delete')) },

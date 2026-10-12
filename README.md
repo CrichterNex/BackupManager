@@ -88,6 +88,19 @@ Runs every minute through the scheduler (`php artisan bms:engine` runs one pass 
   reason. It is never counted as a pass.
 - A database lock stops two engine processes running at once.
 
+## Remote servers and the agent
+
+Backups on other machines are tested, and can be started, by a small **agent** that runs on each server (`agent/`,
+one Python file for Linux and Windows). In **Servers**, an admin clicks **Enroll agent** and copies the config shown
+once. From then on:
+
+- **Run now** on the Backups page starts a backup through the agent, and cron schedules on jobs are started
+  automatically while the agent is online.
+- Restore tests for that server run on the agent, so they work for backups BMS cannot read itself.
+- The agent only calls BMS (outbound HTTPS) and only runs actions named in its own local config. BMS sends a name,
+  never a command line. See `agent/README.md` for set-up and what it does and does not prove.
+- Only admins can enroll agents and start backups. Technicians can still queue tests on their assigned servers.
+
 ## Reports
 
 Four reports under **Reports** (admins and managers): compliance, SLA performance, security and access, and DR
@@ -117,7 +130,7 @@ Print, then Save as PDF. Last month's compliance report and last quarter's SLA r
 ## Not built yet
 
 - LDAP login (users can be created as `ldap`, but logging in returns a clear "not configured" error)
-- Backup method integrations (Veeam, Commvault, Acronis, M365, AWS, Azure) and the other seven test types
+- Vendor-managed backups (Veeam, Commvault, Acronis, M365, AWS, Azure) and the other seven test types
 - Email, SMS and Slack delivery (including emailing reports), server-side PDF files, the tender response pack,
   digital signatures, document upload for failures
 - Disabling a company from the UI, Docker packaging

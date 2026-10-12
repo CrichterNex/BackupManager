@@ -25,6 +25,11 @@ class AppServiceProvider extends ServiceProvider
             ->by($request->ip())
             ->response(fn (Request $r) => $limited($r, 'Too many login attempts. Try again later.')));
 
+        // Agents poll every 30 seconds by default, so the ceiling leaves plenty of room.
+        RateLimiter::for('agent', fn (Request $request) => Limit::perHour(config('bms.agent_rate_limit_per_hour'))
+            ->by('agent:'.$request->attributes->get('agent')?->id)
+            ->response(fn (Request $r) => $limited($r, 'Rate limit exceeded')));
+
         // Per-user limit (1000 per hour by default), applied once the caller is known.
         RateLimiter::for('api', fn (Request $request) => Limit::perHour(config('bms.rate_limit_per_hour'))
             ->by('user:'.$request->user()?->id)

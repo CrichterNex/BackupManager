@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\AgentController;
 use App\Http\Controllers\AuditController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
@@ -7,6 +8,7 @@ use App\Http\Controllers\JobController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\PlatformCompanyController;
 use App\Http\Controllers\ReportController;
+use App\Http\Controllers\ServerAgentController;
 use App\Http\Controllers\ServerController;
 use App\Http\Controllers\TestController;
 use App\Http\Controllers\UserController;
@@ -16,6 +18,12 @@ use Illuminate\Support\Facades\Route;
 // Public: login is rate limited per client address, logout only clears the caller's own token.
 Route::post('/auth/login', [AuthController::class, 'login'])->middleware('throttle:login');
 Route::post('/auth/logout', [AuthController::class, 'logout']);
+
+// Agents authenticate with their own secret and can only touch their own commands.
+Route::middleware(['agent', 'throttle:agent'])->prefix('agent')->group(function () {
+    Route::post('/poll', [AgentController::class, 'poll']);
+    Route::post('/commands/{id}/result', [AgentController::class, 'result'])->whereNumber('id');
+});
 
 Route::middleware(['auth:sanctum', 'tenant', 'throttle:api'])->group(function () {
     Route::get('/me', [AuthController::class, 'me']);
@@ -36,7 +44,13 @@ Route::middleware(['auth:sanctum', 'tenant', 'throttle:api'])->group(function ()
         Route::put('/{id}/assignments', [ServerController::class, 'assign'])->middleware('permission:servers:write')->whereNumber('id');
     });
 
+    Route::get('/servers/{id}/agent', [ServerAgentController::class, 'show'])->middleware('permission:servers:read')->whereNumber('id');
+    Route::post('/servers/{id}/agent', [ServerAgentController::class, 'enroll'])->middleware('permission:servers:write')->whereNumber('id');
+    Route::delete('/servers/{id}/agent', [ServerAgentController::class, 'destroy'])->middleware('permission:servers:write')->whereNumber('id');
+    Route::get('/agent-commands', [ServerAgentController::class, 'commands'])->middleware('permission:jobs:read');
+
     Route::prefix('backup-jobs')->group(function () {
+        Route::post('/{id}/run', [ServerAgentController::class, 'runBackup'])->middleware('permission:backups:run')->whereNumber('id');
         Route::get('/', [JobController::class, 'index'])->middleware('permission:jobs:read');
         Route::get('/{id}', [JobController::class, 'show'])->middleware('permission:jobs:read')->whereNumber('id');
         Route::post('/', [JobController::class, 'store'])->middleware('permission:jobs:write');

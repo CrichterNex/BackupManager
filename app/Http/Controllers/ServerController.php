@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Agent;
 use App\Models\BackupJob;
 use App\Models\Company;
 use App\Models\Server;
@@ -58,7 +59,7 @@ class ServerController extends Controller
         $assigned = DB::table('server_assignments as a')->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('a.server_id', $server->id)->orderBy('u.username')->get(['u.id', 'u.username']);
 
-        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned]]);
+        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned, 'agent' => ($agent = Agent::where('server_id', $server->id)->first()) ? $agent->summary() : ['enrolled' => false]]]);
     }
 
     private function rules(bool $partial): array

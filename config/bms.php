@@ -13,5 +13,7 @@ return [
     'random_restore_every_days' => (int) env('BMS_RANDOM_RESTORE_EVERY_DAYS', 7),
     'restore_staging_dir' => env('BMS_RESTORE_STAGING_DIR') ?: '',
 
+    'agent_rate_limit_per_hour' => (int) env('BMS_AGENT_RATE_LIMIT_PER_HOUR', 1200),
+
     'min_password_length' => 12,
 ];

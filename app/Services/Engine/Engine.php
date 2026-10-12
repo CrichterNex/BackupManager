@@ -5,6 +5,7 @@ namespace App\Services\Engine;
 use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
 use App\Models\Company;
+use App\Services\Agents\AgentService;
 use App\Services\Reports\ReportService;
 use App\Services\TestResults;
 use App\Support\CompanyContext;
@@ -29,7 +30,7 @@ final class Engine
                  SELECT ?, j.id, 'random_restore', ?, ?, ?
                    FROM backup_jobs j JOIN servers s ON s.id = j.server_id
                   WHERE j.company_id = ? AND j.deleted_at IS NULL AND s.active = 1 AND j.status = 'success'
-                    AND j.backup_method IN ($placeholders)
+                    AND (j.backup_method IN ($placeholders) OR EXISTS (SELECT 1 FROM agents ag WHERE ag.server_id = s.id AND ag.active = 1))
                     AND j.id = (SELECT MAX(id) FROM backup_jobs WHERE server_id = j.server_id AND deleted_at IS NULL AND status = 'success')
                     AND NOT EXISTS (
                       SELECT 1 FROM backup_test_executions t
@@ -53,9 +54,9 @@ final class Engine
             }
             $t->forceFill(['test_status' => 'running', 'started_time' => now()])->save();
             $j = DB::table('backup_jobs as j')->join('servers as s', 's.id', '=', 'j.server_id')->where('j.id', $t->backup_job_id)
-                ->first(['j.backup_method', 's.hostname', 's.backup_location_path']);
+                ->first(['j.server_id', 'j.backup_method', 's.hostname', 's.backup_location_path']);
 
-            return ['id' => $t->id, 'test_type' => $t->test_type, 'backup_method' => $j->backup_method, 'hostname' => $j->hostname, 'path' => $j->backup_location_path];
+            return ['id' => $t->id, 'test_type' => $t->test_type, 'server_id' => $j->server_id, 'backup_method' => $j->backup_method, 'hostname' => $j->hostname, 'path' => $j->backup_location_path];
         });
     }
 
@@ -97,6 +98,15 @@ final class Engine
             $n = 0;
             while ($t = self::claimNext()) {
                 $n++;
+                // A server with an agent is tested by the agent, on the machine that holds the backup.
+                if ($agent = AgentService::forServer($t['server_id'])) {
+                    [$queued, $why] = AgentService::queueRestoreTest(BackupTestExecution::findOrFail($t['id']), $agent);
+                    if (! $queued) {
+                        TestResults::skip($t['id'], $why);
+                    }
+
+                    continue;
+                }
                 try {
                     $outcome = self::execute($t);
                 } catch (Throwable $e) {
@@ -153,13 +163,15 @@ final class Engine
         }
         try {
             $queued = self::scheduleDueTests();
-            $ran = $escalated = 0;
+            $ran = $escalated = $expired = $backups = 0;
             foreach (Company::where('is_active', true)->pluck('id') as $id) {
                 $ran += self::runDueTests($id);
                 $escalated += self::escalateFailures($id);
+                $expired += AgentService::expireStale($id);
+                $backups += AgentService::scheduleDueBackups($id);
             }
 
-            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'reports' => ReportService::generateScheduled()];
+            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'expired' => $expired, 'backups' => $backups, 'reports' => ReportService::generateScheduled()];
         } finally {
             DB::select('SELECT RELEASE_LOCK(?)', [self::LOCK]);
         }
