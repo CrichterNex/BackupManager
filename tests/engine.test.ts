@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { pool, withCompany } from '../src/db.js';
 import { escalateFailures, runDueTests, scheduleDueTests } from '../src/engine/engine.js';
 import { runRandomRestore } from '../src/engine/runners.js';
-import { app, login, makeCompany, makeUser, resetDb, type Client } from './helpers.js';
+import { app, login, makeCompany, q, makeUser, resetDb, type Client } from './helpers.js';
 
 let admin: Client;
 let companyId: number;
@@ -15,11 +15,11 @@ const staging = path.join(os.tmpdir(), 'bms-test-staging');
 async function makeJob(hostname: string, method: string, backupPath: string | null, status = 'success') {
   const server = (await admin.post('/api/servers', { hostname, os_type: 'linux', backup_methods: [method], backup_location_path: backupPath ?? undefined })).body.data.id;
   const job = (await admin.post('/api/backup-jobs', { server_id: server, backup_method: method })).body.data.id;
-  await pool.query('UPDATE backup_jobs SET status = $2 WHERE id = $1', [job, status]);
+  await q(companyId, 'UPDATE backup_jobs SET status = $2 WHERE id = $1', [job, status]);
   return { server, job };
 }
 
-const tests = (jobId: number) => pool.query('SELECT * FROM backup_test_executions WHERE backup_job_id = $1 ORDER BY id', [jobId]).then((r) => r.rows);
+const tests = (jobId: number) => q(companyId, 'SELECT * FROM backup_test_executions WHERE backup_job_id = $1 ORDER BY id', [jobId]).then((r) => r.rows);
 
 beforeAll(async () => {
   void app;
@@ -71,7 +71,7 @@ describe('scheduling and execution', () => {
 
   it('records a pass and updates the server and job', async () => {
     await runDueTests(companyId);
-    const { rows } = await pool.query(`SELECT t.test_status, t.hash_match, s.last_test_status FROM backup_test_executions t
+    const { rows } = await q(companyId, `SELECT t.test_status, t.hash_match, s.last_test_status FROM backup_test_executions t
       JOIN backup_jobs j ON j.id = t.backup_job_id JOIN servers s ON s.id = j.server_id WHERE s.hostname = 'good-01'`);
     expect(rows[0]).toMatchObject({ test_status: 'success', hash_match: true, last_test_status: 'passed' });
   });
@@ -93,20 +93,20 @@ describe('scheduling and execution', () => {
       await runDueTests(companyId);
       const rows = await tests(job);
       expect(rows).toHaveLength(Math.min(attempt + 1, 3));
-      const failures = await pool.query('SELECT * FROM backup_test_failures f JOIN backup_test_executions t ON t.id = f.test_execution_id WHERE t.backup_job_id = $1', [job]);
+      const failures = await q(companyId, 'SELECT * FROM backup_test_failures f JOIN backup_test_executions t ON t.id = f.test_execution_id WHERE t.backup_job_id = $1', [job]);
       expect(failures.rows).toHaveLength(attempt === 3 ? 1 : 0);
-      if (attempt < 3) await pool.query(`UPDATE backup_test_executions SET scheduled_time = NOW() WHERE backup_job_id = $1 AND test_status = 'pending'`, [job]);
+      if (attempt < 3) await q(companyId, `UPDATE backup_test_executions SET scheduled_time = NOW() WHERE backup_job_id = $1 AND test_status = 'pending'`, [job]);
     }
-    const alerts = await pool.query(`SELECT message FROM notifications WHERE event_type = 'test_failed'`);
+    const alerts = await q(companyId, `SELECT message FROM notifications WHERE event_type = 'test_failed'`);
     expect(alerts.rows).toHaveLength(1);
     expect(alerts.rows[0].message).toMatch(/failed 3 times/);
   });
 
   it('escalates unresolved failures to managers once per level', async () => {
-    await pool.query(`UPDATE backup_test_failures SET created_at = NOW() - INTERVAL '5 hours'`);
+    await q(companyId, `UPDATE backup_test_failures SET created_at = NOW() - INTERVAL '5 hours'`);
     expect(await escalateFailures(companyId)).toBe(1);
     expect(await escalateFailures(companyId)).toBe(0);
-    await pool.query(`UPDATE backup_test_failures SET created_at = NOW() - INTERVAL '9 hours'`);
+    await q(companyId, `UPDATE backup_test_failures SET created_at = NOW() - INTERVAL '9 hours'`);
     expect(await escalateFailures(companyId)).toBe(1);
     const n = await withCompany(companyId, (db) => db.query(`SELECT u.role FROM notifications n JOIN users u ON u.id = n.user_id WHERE n.event_type = 'failure_escalated'`));
     expect(n.rows.map((r) => r.role).sort()).toEqual(['company_admin', 'company_admin', 'company_manager', 'company_manager']);

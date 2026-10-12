@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
-import { pool } from '../src/db.js';
+import { pool, withCompany } from '../src/db.js';
 import type { Role } from '../src/types.js';
 
 export const app = createApp();
@@ -43,3 +43,6 @@ export async function login(username: string, password = PASSWORD) {
 }
 
 export type Client = Awaited<ReturnType<typeof login>>;
+
+/** Direct query as one company. The app role is subject to row-level security, so tests must name a tenant. */
+export const q = (companyId: number, sql: string, params: unknown[] = []) => withCompany(companyId, (db) => db.query(sql, params));

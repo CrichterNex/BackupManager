@@ -282,8 +282,8 @@ const DAY_MS = 86400000;
 const PERIODS = {
   last_month: { label: 'Last calendar month', range: () => { const n = new Date(); return [Date.UTC(n.getUTCFullYear(), n.getUTCMonth() - 1, 1), Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1)]; } },
   last_quarter: { label: 'Last calendar quarter', range: () => { const n = new Date(); const q = Math.floor(n.getUTCMonth() / 3); return [Date.UTC(n.getUTCFullYear(), (q - 1) * 3, 1), Date.UTC(n.getUTCFullYear(), q * 3, 1)]; } },
-  last_30: { label: 'Last 30 days', range: () => [Date.now() - 30 * DAY_MS, Date.now()] },
-  last_90: { label: 'Last 90 days', range: () => [Date.now() - 90 * DAY_MS, Date.now()] },
+  last_30: { label: 'Last 30 days', range: () => [Date.now() - 30 * DAY_MS, Date.now() + 60000] },
+  last_90: { label: 'Last 90 days', range: () => [Date.now() - 90 * DAY_MS, Date.now() + 60000] },
 };
 async function reports() {
   const r = await api('GET', '/reports?limit=100');

@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { pool, withCompany } from '../src/db.js';
 import { generateScheduledReports } from '../src/reports/service.js';
 import { recordTestResult } from '../src/services.js';
-import { login, makeCompany, makeUser, resetDb, type Client } from './helpers.js';
+import { login, makeCompany, q, makeUser, resetDb, type Client } from './helpers.js';
 
 let admin: Client, manager: Client, tech: Client, other: Client;
 let companyId: number, otherId: number;
@@ -13,7 +13,7 @@ const period = () => ({ period_start: new Date(Date.now() - 30 * DAY).toISOStrin
 
 async function finishedJob(serverId: number, status: string, daysAgo: number) {
   const done = new Date(Date.now() - daysAgo * DAY);
-  await pool.query(
+  await q(companyId, 
     `INSERT INTO backup_jobs (company_id, server_id, backup_method, status, started_time, completed_time, size_gb)
      VALUES ($1,$2,'rsync',$3,$4,$5,10)`, [companyId, serverId, status, new Date(done.getTime() - 2 * 3600_000), done]);
 }
@@ -42,7 +42,7 @@ beforeAll(async () => {
   const jobB = (await admin.post('/api/backup-jobs', { server_id: serverB, backup_method: 'rsync' })).body.data.id;
   for (const d of [1, 2, 3]) await finishedJob(serverA, 'success', d);
   await finishedJob(serverB, 'failed', 1);
-  await pool.query(`UPDATE servers SET last_backup_time = NOW() - INTERVAL '2 hours', last_backup_status = 'success' WHERE id = $1`, [serverA]);
+  await q(companyId, `UPDATE servers SET last_backup_time = NOW() - INTERVAL '2 hours', last_backup_status = 'success' WHERE id = $1`, [serverA]);
   await runTest(jobA, { success: true, hash_algorithm: 'sha256', hash_original: 'aa', hash_restored: 'aa' });
   await runTest(jobA, { success: true, hash_algorithm: 'sha256', hash_original: 'bb', hash_restored: 'bb' });
   await runTest(jobB, { success: false, failure_type: 'hash_mismatch', severity: 'critical', hash_original: 'cc', hash_restored: 'dd', error_message: 'mismatch' });
@@ -73,10 +73,10 @@ describe('compliance report', () => {
 
   it('keeps an archived report fixed after the data changes', async () => {
     const id = (await admin.post('/api/reports', { report_type: 'compliance', ...period() })).body.data.id;
-    await pool.query(`UPDATE backup_jobs SET status = 'failed'`);
+    await q(companyId, `UPDATE backup_jobs SET status = 'failed'`);
     const d = (await admin.get(`/api/reports/${id}`)).body.data.data;
     expect(d.backups.success).toBe(3);
-    await pool.query(`UPDATE backup_jobs SET status = 'success' WHERE server_id = $1`, [serverA]);
+    await q(companyId, `UPDATE backup_jobs SET status = 'success' WHERE server_id = $1`, [serverA]);
   });
 });
 
@@ -141,7 +141,7 @@ describe('access and safety', () => {
   });
 
   it('audits report generation', async () => {
-    const { rows } = await pool.query(`SELECT 1 FROM audit_trail WHERE action = 'report_generated' AND company_id = $1`, [companyId]);
+    const { rows } = await q(companyId, `SELECT 1 FROM audit_trail WHERE action = 'report_generated' AND company_id = $1`, [companyId]);
     expect(rows.length).toBeGreaterThan(0);
   });
 });
@@ -150,11 +150,12 @@ describe('scheduled generation', () => {
   it('archives last month and last quarter once, and only for companies that existed then', async () => {
     await pool.query('TRUNCATE reports');
     await pool.query(`UPDATE companies SET created_at = '2020-01-01' WHERE id = $1`, [companyId]);
-    await pool.query(`UPDATE companies SET created_at = '2026-03-01' WHERE id = $1`, [otherId]);
+    await pool.query(`UPDATE companies SET created_at = '2026-03-02T00:00:00Z' WHERE id = $1`, [otherId]);
     const now = new Date('2026-03-15T10:00:00Z');
     expect(await generateScheduledReports(now)).toBe(2);
     expect(await generateScheduledReports(now)).toBe(0);
-    const { rows } = await pool.query(`SELECT company_id, report_type, period_start::date::text AS s FROM reports ORDER BY company_id, report_type`);
+    const rowsOf = async (id: number) => (await q(id, `SELECT company_id, report_type, period_start::date::text AS s FROM reports ORDER BY report_type`)).rows;
+    const rows = [...(await rowsOf(companyId)), ...(await rowsOf(otherId))];
     expect(rows.filter((r) => r.company_id === companyId)).toEqual([
       { company_id: companyId, report_type: 'compliance', s: '2026-02-01' },
       { company_id: companyId, report_type: 'sla', s: '2025-10-01' },
