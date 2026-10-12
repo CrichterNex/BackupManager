@@ -33,7 +33,7 @@ export async function api(method, path, body) {
   const res = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
-    headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...actingHeader() },
+    headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}), ...actingHeader() },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return null;
@@ -68,7 +68,7 @@ export const fmtAgo = (v) => {
 export const label = (v) => (v ? String(v).replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) : '—');
 
 const TONE = {
-  success: 'ok', passed: 'ok', healthy: 'ok', resolved: 'ok', warning: 'warn', pending_test: 'warn', pending: 'warn',
+  success: 'ok', passed: 'ok', healthy: 'ok', resolved: 'ok', warning: 'warn', pending_test: 'warn', test_overdue: 'warn', pending: 'warn',
   running: 'info', scheduled: 'info', failed: 'bad', failing: 'bad', critical: 'bad', high: 'bad', medium: 'warn',
 };
 export const badge = (value, text) => h('span', { class: `badge ${TONE[value] ?? ''}` }, text ?? label(value));

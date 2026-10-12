@@ -86,7 +86,9 @@ final class ReportBuilder
         $total = self::one(
             "SELECT COALESCE(SUM(t.test_status IN ('success','failed')), 0) AS run, COALESCE(SUM(t.test_status = 'success'), 0) AS passed,
                     COALESCE(SUM(t.test_status = 'failed'), 0) AS failed, COALESCE(SUM(t.test_status = 'skipped'), 0) AS skipped,
-                    COALESCE(SUM(t.hash_match IS NOT NULL), 0) AS hash_checked, COALESCE(SUM(t.hash_match = 0), 0) AS hash_mismatches $base", $b);
+                    COALESCE(SUM(t.hash_match IS NOT NULL), 0) AS hash_checked, COALESCE(SUM(t.hash_match = 0), 0) AS hash_mismatches,
+                    COALESCE(SUM(t.source_status = 'verified'), 0) AS source_verified, COALESCE(SUM(t.source_status = 'mismatch'), 0) AS source_mismatch,
+                    COALESCE(SUM(t.source_status = 'not_comparable'), 0) AS source_not_comparable $base", $b);
         $byType = collect(DB::select(
             "SELECT t.test_type, COUNT(*) AS run, SUM(t.test_status = 'success') AS passed $base AND t.test_status IN ('success','failed') GROUP BY t.test_type ORDER BY t.test_type", $b))
             ->map(fn ($x) => ['test_type' => $x->test_type, 'run' => (int) $x->run, 'passed' => (int) $x->passed])->all();
@@ -97,6 +99,7 @@ final class ReportBuilder
             'run' => (int) $total->run, 'passed' => (int) $total->passed, 'failed' => (int) $total->failed, 'skipped' => (int) $total->skipped,
             'pass_rate_pct' => self::pct((int) $total->passed, (int) $total->run),
             'hash_checked' => (int) $total->hash_checked, 'hash_mismatches' => (int) $total->hash_mismatches,
+            'source_verified' => (int) $total->source_verified, 'source_mismatch' => (int) $total->source_mismatch, 'source_not_comparable' => (int) $total->source_not_comparable,
             'by_type' => $byType,
             'servers_active' => $active, 'servers_tested' => $tested,
             'coverage_pct' => self::pct($tested, $active),
@@ -173,7 +176,7 @@ final class ReportBuilder
         $tests = self::tests($companyId, $from, $to);
         $failures = self::failures($companyId, $from, $to);
         $servers = self::one(
-            'SELECT COUNT(*) AS total, COALESCE(SUM(backup_location_path IS NOT NULL), 0) AS with_location, COALESCE(SUM(retention_policy_days IS NOT NULL), 0) AS with_retention FROM servers WHERE company_id = ? AND active = 1',
+            'SELECT COUNT(*) AS total, COALESCE(SUM(EXISTS (SELECT 1 FROM backup_jobs j WHERE j.server_id = servers.id AND j.location_id IS NOT NULL AND j.deleted_at IS NULL)), 0) AS with_location, COALESCE(SUM(retention_policy_days IS NOT NULL), 0) AS with_retention FROM servers WHERE company_id = ? AND active = 1',
             [$companyId]);
         $audit = (int) self::one('SELECT COUNT(*) AS n FROM audit_trail WHERE company_id = ? AND created_at >= ? AND created_at < ?', [$companyId, $from, $to])->n;
         $o = $failures['open_now'];
@@ -246,6 +249,32 @@ final class ReportBuilder
         ];
     }
 
+    /**
+     * What a server's jobs are stated to cover: 'Full server', 'Folders: /a, /b', and any exclusions ('(except /a/tmp)'),
+     * or null when no job says. Jobs without exclusions are merged, and a job with exclusions keeps its own phrase so an
+     * exclusion is never shown against folders it does not belong to.
+     */
+    public static function scopeSummary(array $jobs): ?string
+    {
+        $full = false;
+        $plain = $special = [];
+        foreach ($jobs as $j) {
+            $include = json_decode($j->source_paths ?? '[]', true) ?: [];
+            $except = json_decode($j->excluded_paths ?? '[]', true) ?: [];
+            if ($j->scope_type === 'full_server') {
+                $except ? $special[] = 'Full server (except '.implode(', ', $except).')' : $full = true;
+            } elseif ($j->scope_type === 'folders') {
+                $except ? $special[] = 'Folders: '.implode(', ', $include).' (except '.implode(', ', $except).')' : $plain = array_merge($plain, $include);
+            }
+        }
+        $parts = [];
+        $full && $parts[] = 'Full server';
+        $plain && $parts[] = 'Folders: '.implode(', ', array_values(array_unique($plain)));
+        $parts = array_merge($parts, array_values(array_unique($special)));
+
+        return $parts ? implode('; ', $parts) : null;
+    }
+
     public static function dr(int $companyId, array $params = self::DEFAULT_DR): array
     {
         $now = CarbonImmutable::now('UTC');
@@ -255,6 +284,11 @@ final class ReportBuilder
                       WHERE j.server_id = s.id AND f.resolved = 0 AND f.severity IN ('critical','high')) AS open_serious
                FROM servers s WHERE s.company_id = ? AND s.active = 1 ORDER BY s.hostname", [$companyId]);
         $servers = [];
+        // What each server's jobs say they cover. Admin-entered, so the report labels it as the stated scope.
+        $scopes = [];
+        foreach (DB::select('SELECT server_id, scope_type, source_paths, excluded_paths FROM backup_jobs WHERE company_id = ? AND deleted_at IS NULL', [$companyId]) as $j) {
+            $scopes[$j->server_id][] = $j;
+        }
         foreach ($rows as $r) {
             $backupAge = $r->last_backup_time ? CarbonImmutable::parse($r->last_backup_time, 'UTC')->diffInSeconds($now) / 3600 : null;
             $testAge = $r->last_test_time ? CarbonImmutable::parse($r->last_test_time, 'UTC')->diffInSeconds($now) / 86400 : null;
@@ -281,6 +315,7 @@ final class ReportBuilder
                 'last_backup_time' => self::iso($r->last_backup_time), 'last_backup_status' => $r->last_backup_status,
                 'last_test_time' => self::iso($r->last_test_time), 'last_test_status' => $r->last_test_status,
                 'backup_age_hours' => $backupAge === null ? null : round($backupAge, 1), 'test_age_days' => $testAge === null ? null : round($testAge, 1),
+                'scope' => self::scopeSummary($scopes[$r->id] ?? []),
                 'ready' => ! $reasons, 'reasons' => $reasons,
             ];
         }

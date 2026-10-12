@@ -8,6 +8,7 @@ use App\Models\ServerLink;
 use App\Services\Audit;
 use App\Services\Integrations\AcronisClient;
 use App\Services\Integrations\IntegrationException;
+use App\Services\Integrations\IntegrationImport;
 use App\Services\Integrations\IntegrationSync;
 use App\Support\ApiException;
 use Illuminate\Http\Request;
@@ -49,10 +50,13 @@ class IntegrationController extends Controller
             'client_id' => ['required', 'string', 'max:255'],
             'client_secret' => ['required', 'string', 'max:512'],
             'stale_after_hours' => ['sometimes', 'integer:strict', 'min:1', 'max:720'],
+            'auto_import' => ['sometimes', 'boolean:strict'],
+            'auto_import_os' => ['sometimes', 'in:linux,windows'],
         ]);
         $url = $this->guard(fn () => AcronisClient::normalizeUrl($b['base_url']));
         $integration = new Integration([
             'platform' => $b['platform'], 'name' => $b['name'], 'base_url' => $url, 'stale_after_hours' => $b['stale_after_hours'] ?? 36,
+            'auto_import' => $b['auto_import'] ?? false, 'auto_import_os' => $b['auto_import_os'] ?? 'windows',
             'credentials' => ['client_id' => $b['client_id'], 'client_secret' => $b['client_secret']], 'created_by' => $request->user()->id,
         ]);
         // Prove the credentials work before saving them, so a typo is caught here and not at 3 a.m.
@@ -63,6 +67,32 @@ class IntegrationController extends Controller
         });
 
         return response()->json(['success' => true, 'data' => $this->present($integration->refresh()), 'devices_visible' => $devices], 201);
+    }
+
+    /**
+     * Change a connection's settings. Turning auto-import on is the one that matters: from the next sync, BMS adds
+     * devices that have a protection plan as servers without anyone picking them, so it is logged on its own.
+     */
+    public function update(Request $request, int $id)
+    {
+        $b = $request->validate([
+            'name' => ['sometimes', 'string', 'min:2', 'max:255'],
+            'stale_after_hours' => ['sometimes', 'integer:strict', 'min:1', 'max:720'],
+            'auto_import' => ['sometimes', 'boolean:strict'],
+            'auto_import_os' => ['sometimes', 'in:linux,windows'],
+        ]);
+        if (! $b) {
+            throw ApiException::badRequest('No fields to update');
+        }
+        $i = DB::transaction(function () use ($id, $b, $request) {
+            $i = $this->find($id);
+            $i->fill($b)->save();
+            Audit::log($request, 'integration_updated', 'integration', $i->id, $b);
+
+            return $i->refresh();
+        });
+
+        return response()->json(['success' => true, 'data' => $this->present($i)]);
     }
 
     public function destroy(Request $request, int $id)
@@ -100,10 +130,38 @@ class IntegrationController extends Controller
         $linked = ServerLink::where('integration_id', $i->id)->pluck('server_id', 'external_id');
         $devices = $this->guard(fn () => (new AcronisClient($i))->listMachines());
 
+        $byHostname = Server::where('active', true)->pluck('id', 'hostname')->mapWithKeys(fn ($sid, $h) => [strtolower($h) => $sid]);
+
         return response()->json(['success' => true, 'data' => collect($devices)->map(fn ($d) => [
             'id' => $d['id'], 'name' => $d['name'], 'status' => $d['status'], 'plans' => $d['plans'],
             'last_success_at' => $d['last_success_at']?->toIso8601ZuluString(), 'linked_server_id' => $linked[$d['id']] ?? null,
+            // For the import dialog: does it have a plan, what would the server be called, and is that name already taken.
+            'protected' => IntegrationImport::isProtected($d),
+            'suggested_hostname' => ($h = IntegrationImport::hostnameFor($d['name'])),
+            'matches_server_id' => $h ? ($byHostname[strtolower($h)] ?? null) : null,
         ])->sortBy('name')->values()]);
+    }
+
+    /**
+     * Create servers from devices the admin picked, and link them. A device whose name matches an existing server is
+     * linked to it (unless told not to) instead of creating a duplicate. Nothing is imported unless it is listed.
+     */
+    public function import(Request $request, int $id)
+    {
+        $b = $request->validate([
+            'external_ids' => ['required', 'array', 'min:1', 'max:500'],
+            'external_ids.*' => ['string', 'max:255'],
+            'os_type' => ['required', 'in:linux,windows'],
+            'link_existing' => ['sometimes', 'boolean:strict'],
+        ]);
+        $i = $this->find($id);
+        $summary = $this->guard(fn () => IntegrationImport::run($i, $b['external_ids'], $b['os_type'], $b['link_existing'] ?? true));
+        Audit::log($request, 'integration_import', 'integration', $i->id, [
+            'requested' => count($b['external_ids']), 'created' => $summary['created'], 'linked_existing' => $summary['linked_existing'], 'skipped' => $summary['skipped'],
+            'server_ids' => array_values(array_filter(array_column($summary['results'], 'server_id'))),
+        ]);
+
+        return response()->json(['success' => true, 'data' => $summary]);
     }
 
     // --- server links ---

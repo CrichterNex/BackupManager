@@ -80,14 +80,18 @@ final class AgentService
      *
      * @return array{0: bool, 1: ?string}
      */
-    public static function queueRestoreTest(BackupTestExecution $test, Agent $agent): array
+    public static function queueRestoreTest(BackupTestExecution $test, Agent $agent, ?string $locationKey = null, ?string $subpath = null, ?array $source = null): array
     {
         $name = $agent->actionFor('restore_test');
         if ($name === null) {
             return [false, 'The agent has no restore_test action. Add one to its config file.'];
         }
+        // The job's location is sent as a key only. The agent turns it into a path from its own config, so BMS never sends a path.
+        if ($locationKey !== null && ! in_array($locationKey, $agent->locations ?? [], true)) {
+            return [false, "The agent does not know the location \"$locationKey\". Add it under \"locations\" in the agent's config file, then restart the agent."];
+        }
         AgentCommand::create([
-            'agent_id' => $agent->id, 'type' => 'restore_test', 'action' => $name, 'test_execution_id' => $test->id,
+            'agent_id' => $agent->id, 'type' => 'restore_test', 'action' => $name, 'location_key' => $locationKey, 'location_subpath' => $locationKey ? $subpath : null, 'payload' => $source, 'test_execution_id' => $test->id,
             'backup_job_id' => $test->backup_job_id, 'requested_by' => $test->executed_by, 'deadline_at' => now()->addHours(self::TEST_DEADLINE_HOURS),
         ]);
 
@@ -102,7 +106,7 @@ final class AgentService
         return DB::transaction(function () use ($agent, $info) {
             $agent->forceFill([
                 'last_seen_at' => now(), 'agent_version' => $info['version'] ?? null, 'os_info' => $info['os'] ?? null,
-                'actions' => $info['actions'] ?? [],
+                'actions' => $info['actions'] ?? [], 'locations' => array_values($info['locations'] ?? []), 'source_roots' => array_values($info['source_roots'] ?? []),
             ])->save();
             if (! empty($info['busy'])) {
                 return null; // a heartbeat from an agent that is already running something
@@ -161,7 +165,8 @@ final class AgentService
     private static function finishRestoreTest(AgentCommand $cmd, bool $ok, array $d): void
     {
         $result = ['success' => $ok, 'hash_algorithm' => $d['hash_algorithm'] ?? null, 'hash_original' => $d['hash_original'] ?? null,
-            'hash_restored' => $d['hash_restored'] ?? null, 'failed_item' => $d['failed_item'] ?? null, 'error_message' => $d['error_message'] ?? null];
+            'hash_restored' => $d['hash_restored'] ?? null, 'failed_item' => $d['failed_item'] ?? null, 'error_message' => $d['error_message'] ?? null,
+            'source_status' => $d['source_status'] ?? null, 'source_note' => $d['source_note'] ?? null];
         if (! $ok) {
             $type = $d['failure_type'] ?? 'restore_failed';
             $result['failure_type'] = in_array($type, ['file_missing', 'hash_mismatch', 'corruption', 'timeout', 'access_denied', 'restore_failed'], true) ? $type : 'restore_failed';

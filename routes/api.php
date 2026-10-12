@@ -1,11 +1,13 @@
 <?php
 
 use App\Http\Controllers\AgentController;
+use App\Http\Controllers\AgentsController;
 use App\Http\Controllers\AuditController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\IntegrationController;
 use App\Http\Controllers\JobController;
+use App\Http\Controllers\LocationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\PlatformCompanyController;
 use App\Http\Controllers\ReportController;
@@ -48,18 +50,27 @@ Route::middleware(['auth:sanctum', 'tenant', 'throttle:api'])->group(function ()
     Route::get('/servers/{id}/agent', [ServerAgentController::class, 'show'])->middleware('permission:servers:read')->whereNumber('id');
     Route::post('/servers/{id}/agent', [ServerAgentController::class, 'enroll'])->middleware('permission:servers:write')->whereNumber('id');
     Route::delete('/servers/{id}/agent', [ServerAgentController::class, 'destroy'])->middleware('permission:servers:write')->whereNumber('id');
+    // Backup locations for BMS-managed backups: everyone who can see jobs can see them, admins manage them.
+    Route::get('/backup-locations', [LocationController::class, 'index'])->middleware('permission:jobs:read');
+    Route::post('/backup-locations', [LocationController::class, 'store'])->middleware('permission:locations:manage');
+    Route::patch('/backup-locations/{id}', [LocationController::class, 'update'])->middleware('permission:locations:manage')->whereNumber('id');
+    Route::delete('/backup-locations/{id}', [LocationController::class, 'destroy'])->middleware('permission:locations:manage')->whereNumber('id');
+
     // External backup platforms: connections are admin-only, a server's links follow server permissions.
     Route::middleware('permission:integrations:manage')->prefix('integrations')->group(function () {
         Route::get('/', [IntegrationController::class, 'index']);
         Route::post('/', [IntegrationController::class, 'store']);
+        Route::patch('/{id}', [IntegrationController::class, 'update'])->whereNumber('id');
         Route::delete('/{id}', [IntegrationController::class, 'destroy'])->whereNumber('id');
         Route::post('/{id}/test', [IntegrationController::class, 'test'])->whereNumber('id');
         Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->whereNumber('id');
         Route::get('/{id}/devices', [IntegrationController::class, 'devices'])->whereNumber('id');
+        Route::post('/{id}/import', [IntegrationController::class, 'import'])->whereNumber('id');
     });
     Route::get('/servers/{id}/links', [IntegrationController::class, 'links'])->middleware('permission:servers:read')->whereNumber('id');
     Route::post('/servers/{id}/links', [IntegrationController::class, 'link'])->middleware('permission:servers:write')->whereNumber('id');
     Route::delete('/servers/{id}/links/{linkId}', [IntegrationController::class, 'unlink'])->middleware('permission:servers:write')->whereNumber('id')->whereNumber('linkId');
+    Route::get('/agents', [AgentsController::class, 'index'])->middleware('permission:servers:read');
     Route::get('/agent-commands', [ServerAgentController::class, 'commands'])->middleware('permission:jobs:read');
 
     Route::prefix('backup-jobs')->group(function () {

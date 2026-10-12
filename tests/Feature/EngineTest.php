@@ -61,8 +61,10 @@ class EngineTest extends TestCase
     /** @return array{server: int, job: int} */
     private function makeJob(string $hostname, string $method, ?string $path, string $status = 'success'): array
     {
-        $server = $this->admin->post('/api/servers', ['hostname' => $hostname, 'os_type' => 'linux', 'backup_methods' => [$method], 'backup_location_path' => $path])->json('data.id');
-        $job = $this->admin->post('/api/backup-jobs', ['server_id' => $server, 'backup_method' => $method])->json('data.id');
+        $server = $this->admin->post('/api/servers', ['hostname' => $hostname, 'os_type' => 'linux', 'backup_methods' => [$method]])->json('data.id');
+        // Locations are for BMS-managed backups. A platform method (veeam, acronis, ...) never gets one.
+        $location = $path ? $this->admin->post('/api/backup-locations', ['name' => "$hostname backups", 'loc_key' => $hostname, 'path' => $path])->json('data.id') : null;
+        $job = $this->admin->post('/api/backup-jobs', ['server_id' => $server, 'backup_method' => $method] + ($location ? ['location_id' => $location] : []))->json('data.id');
         DB::table('backup_jobs')->where('id', $job)->update(['status' => $status]);
 
         return ['server' => $server, 'job' => $job];
@@ -124,7 +126,7 @@ class EngineTest extends TestCase
         Engine::runDueTests($this->companyId);
         $t = $this->executionsFor($job)[0];
         $this->assertSame('skipped', $t->test_status);
-        $this->assertMatchesRegularExpression('/not available for veeam/', $t->error_message);
+        $this->assertMatchesRegularExpression('/stored on that platform/', $t->error_message);
     }
 
     public function test_a_failure_is_retried_quietly_then_recorded_once_and_alerted_after_the_last_attempt(): void

@@ -15,7 +15,7 @@ class AgentCommand extends Model
 
     protected function casts(): array
     {
-        return ['details' => 'array', 'deadline_at' => 'datetime', 'started_at' => 'datetime', 'completed_at' => 'datetime', 'exit_code' => 'integer'];
+        return ['details' => 'array', 'payload' => 'array', 'deadline_at' => 'datetime', 'started_at' => 'datetime', 'completed_at' => 'datetime', 'exit_code' => 'integer'];
     }
 
     public function agent()

@@ -5,9 +5,11 @@ namespace App\Http\Controllers;
 use App\Models\Agent;
 use App\Models\AgentCommand;
 use App\Models\BackupJob;
+use App\Models\BackupLocation;
 use App\Models\Server;
 use App\Services\Agents\AgentService;
 use App\Services\Audit;
+use App\Support\AgentRelease;
 use App\Support\ApiException;
 use App\Support\Page;
 use App\Support\Scope;
@@ -48,6 +50,9 @@ class ServerAgentController extends Controller
             'data' => $agent->summary(),
             // Shown once. Only a hash is stored, so it cannot be shown again, only replaced by removing and re-enrolling.
             'agent_config' => ['bms_url' => $request->getSchemeAndHttpHost(), 'token' => $secret],
+            // Copy-and-run commands that download the agent and install it as a service. They carry the secret, so they are shown once too.
+            'install' => AgentRelease::installCommands($request->getSchemeAndHttpHost(), $secret, BackupLocation::orderBy('name')->pluck('loc_key')->all()),
+            'agent_release' => AgentRelease::summary(),
         ], 201);
     }
 

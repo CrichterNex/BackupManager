@@ -20,6 +20,8 @@ class BackupJob extends Model
     {
         return [
             'incremental' => 'boolean',
+            'source_paths' => 'array',
+            'excluded_paths' => 'array',
             'size_gb' => 'float',
             'retention_days' => 'integer',
             'files_count' => 'integer',

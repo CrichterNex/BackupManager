@@ -25,6 +25,8 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        // There is no login page to send guests to: the web app shows its own login screen when the API answers 401.
+        $middleware->redirectGuestsTo(fn () => null);
         $middleware->append([RequestId::class, SecurityHeaders::class]);
         $middleware->prependToGroup('api', CookieToken::class);
         $middleware->alias(['permission' => RequirePermission::class, 'tenant' => ResolveTenant::class, 'platform' => RequirePlatformAdmin::class, 'agent' => AgentAuth::class]);

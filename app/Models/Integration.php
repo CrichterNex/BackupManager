@@ -18,7 +18,7 @@ class Integration extends Model
 
     protected function casts(): array
     {
-        return ['credentials' => 'encrypted:array', 'active' => 'boolean', 'stale_after_hours' => 'integer', 'last_sync_at' => 'datetime'];
+        return ['credentials' => 'encrypted:array', 'active' => 'boolean', 'auto_import' => 'boolean', 'stale_after_hours' => 'integer', 'last_sync_at' => 'datetime'];
     }
 
     public function getClientIdHintAttribute(): ?string

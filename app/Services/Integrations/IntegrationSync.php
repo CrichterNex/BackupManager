@@ -6,9 +6,11 @@ use App\Models\BackupJob;
 use App\Models\Integration;
 use App\Models\Server;
 use App\Models\ServerLink;
+use App\Services\Audit;
 use App\Services\TestResults;
 use App\Support\CompanyContext;
 use Carbon\CarbonImmutable;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -23,7 +25,6 @@ final class IntegrationSync
     /** @return array{status: string, linked: int, error: ?string} */
     public static function run(Integration $integration): array
     {
-        $linked = $integration->links()->count();
         try {
             $devices = collect((new AcronisClient($integration))->listMachines())->keyBy('id');
         } catch (IntegrationException $e) {
@@ -33,8 +34,13 @@ final class IntegrationSync
                 TestResults::notifyAdmins('integration_error', "Cannot read backup status from {$integration->name}", $e->getMessage());
             }
 
-            return ['status' => 'error', 'linked' => $linked, 'error' => $e->getMessage()];
+            return ['status' => 'error', 'linked' => $integration->links()->count(), 'error' => $e->getMessage()];
         }
+
+        if ($integration->auto_import) {
+            self::autoImport($integration, $devices);
+        }
+        $linked = $integration->links()->count();
 
         foreach ($integration->links()->with('server')->get() as $link) {
             self::apply($integration, $link, $devices->get($link->external_id));
@@ -42,6 +48,28 @@ final class IntegrationSync
         $integration->forceFill(['last_sync_at' => now(), 'last_sync_status' => 'ok', 'last_sync_error' => null])->save();
 
         return ['status' => 'ok', 'linked' => $linked, 'error' => null];
+    }
+
+    /**
+     * Add protected devices that are not in BMS yet as servers. Never touches an existing server (a device whose name is
+     * already used is left alone), takes at most a capped number per sync, and tells admins what it added.
+     */
+    private static function autoImport(Integration $integration, Collection $devices): void
+    {
+        $linkedIds = ServerLink::where('integration_id', $integration->id)->pluck('external_id')->all();
+        $candidates = $devices->filter(fn ($d) => IntegrationImport::isProtected($d) && ! in_array($d['id'], $linkedIds, true) && IntegrationImport::hostnameFor($d['name']) !== null)
+            ->keys()->take(config('bms.integration_auto_import_max_per_sync'))->all();
+        if (! $candidates) {
+            return;
+        }
+        $r = IntegrationImport::run($integration, $candidates, $integration->auto_import_os, false, $devices, false);
+        $created = collect($r['results'])->where('outcome', 'created');
+        if ($created->isEmpty()) {
+            return; // everything skipped (name already used, server limit): stay quiet rather than repeat it every sync
+        }
+        $names = $created->pluck('hostname')->take(10)->implode(', ').($created->count() > 10 ? ', and more' : '');
+        TestResults::notifyAdmins('servers_imported', "{$created->count()} new server(s) added from {$integration->name}", "BMS added these servers automatically because they have a protection plan: $names. Check they belong here, and set each server's operating system if it is not {$integration->auto_import_os}.", 'integration', $integration->id);
+        Audit::log(null, 'integration_auto_import', 'integration', $integration->id, ['created' => $created->count(), 'server_ids' => $created->pluck('server_id')->all()], true, ['company_id' => $integration->company_id, 'user_id' => null]);
     }
 
     /** ok when the latest backup run succeeded and is recent, failed when it did not, warning when it is stale. */

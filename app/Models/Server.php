@@ -15,12 +15,22 @@ class Server extends Model
 
     protected $appends = ['status'];
 
-    /** Derived health for list filtering and sorting. Keep in step with getStatusAttribute(). */
-    public const STATUS_SQL = "CASE
+    /**
+     * Derived health for list filtering and sorting. A test result is a point in time, so a passing test only counts as
+     * current for a while (BMS_TEST_FRESH_DAYS, default 14). After that the server shows "test_overdue" instead of
+     * "healthy", because nothing has checked the backup since. Keep in step with getStatusAttribute().
+     */
+    public static function statusSql(): string
+    {
+        $cutoff = now()->subDays(config('bms.test_fresh_days'))->format('Y-m-d H:i:s');
+
+        return "CASE
         WHEN servers.last_backup_status = 'failed' OR servers.last_test_status = 'failed' THEN 'failing'
-        WHEN servers.last_backup_status IN ('success', 'warning') AND servers.last_test_status = 'passed' THEN 'healthy'
+        WHEN servers.last_backup_status IN ('success', 'warning') AND servers.last_test_status = 'passed' AND servers.last_test_time >= '$cutoff' THEN 'healthy'
+        WHEN servers.last_backup_status IN ('success', 'warning') AND servers.last_test_status = 'passed' THEN 'test_overdue'
         WHEN servers.last_backup_status IN ('success', 'warning') AND servers.last_test_status IS NULL THEN 'pending_test'
         ELSE 'unknown' END";
+    }
 
     protected function casts(): array
     {
@@ -41,7 +51,9 @@ class Server extends Model
             return 'failing';
         }
         if (in_array($b, ['success', 'warning'], true) && $t === 'passed') {
-            return 'healthy';
+            $fresh = $this->last_test_time !== null && $this->last_test_time->gte(now()->subDays(config('bms.test_fresh_days')));
+
+            return $fresh ? 'healthy' : 'test_overdue';
         }
         if (in_array($b, ['success', 'warning'], true) && $t === null) {
             return 'pending_test';

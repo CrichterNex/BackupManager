@@ -18,7 +18,7 @@ class Agent extends Model
 
     protected function casts(): array
     {
-        return ['active' => 'boolean', 'actions' => 'array', 'last_seen_at' => 'datetime'];
+        return ['active' => 'boolean', 'actions' => 'array', 'locations' => 'array', 'source_roots' => 'array', 'last_seen_at' => 'datetime'];
     }
 
     public function isOnline(): bool
@@ -31,7 +31,7 @@ class Agent extends Model
     {
         return [
             'enrolled' => true, 'online' => $this->isOnline(), 'last_seen_at' => $this->last_seen_at, 'agent_version' => $this->agent_version,
-            'os_info' => $this->os_info, 'actions' => $this->actions ?? new \stdClass,
+            'os_info' => $this->os_info, 'actions' => $this->actions ?? new \stdClass, 'locations' => $this->locations ?? [], 'source_roots' => $this->source_roots ?? [],
         ];
     }
 

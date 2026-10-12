@@ -10,11 +10,17 @@ return [
     'engine_enabled' => (bool) env('BMS_ENGINE_ENABLED', true),
     'test_retry_delay_minutes' => (int) env('BMS_TEST_RETRY_DELAY_MINUTES', 60),
     'test_max_attempts' => (int) env('BMS_TEST_MAX_ATTEMPTS', 3),
+    // How long a passing test counts as current. After this a server shows "test overdue" until it is tested again.
+    'test_fresh_days' => (int) env('BMS_TEST_FRESH_DAYS', 14),
     'random_restore_every_days' => (int) env('BMS_RANDOM_RESTORE_EVERY_DAYS', 7),
     'restore_staging_dir' => env('BMS_RESTORE_STAGING_DIR') ?: '',
 
     // External backup platforms. BMS only ever calls hosts on these domains (guards against pointing it at internal addresses).
     'integration_allowed_host_suffixes' => array_filter(array_map('trim', explode(',', (string) env('BMS_INTEGRATION_HOST_SUFFIXES', 'acronis.com')))),
+    // Optional: folders on THIS server that backup locations may point into (comma separated). Empty means any absolute path.
+    'location_path_roots' => array_filter(array_map('trim', explode(',', (string) env('BMS_LOCATION_PATH_ROOTS', '')))),
+    // Most servers one sync may auto-import, so a large or surprising device list cannot flood the company in one go.
+    'integration_auto_import_max_per_sync' => (int) env('BMS_AUTO_IMPORT_MAX_PER_SYNC', 25),
     'integration_sync_minutes' => (int) env('BMS_INTEGRATION_SYNC_MINUTES', 15),
 
     'agent_rate_limit_per_hour' => (int) env('BMS_AGENT_RATE_LIMIT_PER_HOUR', 1200),

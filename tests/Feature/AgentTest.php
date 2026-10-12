@@ -154,7 +154,7 @@ class AgentTest extends TestCase
         $this->poll();
         $this->admin->post("/api/backup-jobs/{$this->jobId}/run");
         $cmd = $this->poll()->json('command');
-        $this->assertEqualsCanonicalizing(['id', 'type', 'action', 'deadline_at'], array_keys($cmd));
+        $this->assertEqualsCanonicalizing(['id', 'type', 'action', 'location', 'subpath', 'source', 'deadline_at'], array_keys($cmd));
         $this->assertSame(400, $this->admin->post("/api/backup-jobs/{$this->jobId}/run", ['action' => 'rm -rf /'])->status());
     }
 

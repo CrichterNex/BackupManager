@@ -63,6 +63,8 @@ final class TestResults
                 'hash_restored' => $rest,
                 'hash_match' => ($orig === null || $rest === null) ? null : $orig === $rest,
                 'error_message' => $r['error_message'] ?? null,
+                'source_status' => $r['source_status'] ?? null,
+                'source_note' => isset($r['source_note']) ? mb_substr($r['source_note'], 0, 500) : null,
             ])->save();
 
             // Level 1 of the blueprint's failure handling: an early failure is retried quietly, with no failure record or alert.

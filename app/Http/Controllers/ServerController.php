@@ -20,14 +20,14 @@ use Illuminate\Validation\Rule;
 
 class ServerController extends Controller
 {
-    private const COLS = ['hostname', 'ip_address', 'os_type', 'os_name', 'criticality', 'backup_methods', 'backup_location_path', 'retention_policy_days', 'notes'];
+    private const COLS = ['hostname', 'ip_address', 'os_type', 'os_name', 'criticality', 'backup_methods', 'retention_policy_days', 'notes'];
 
     public function index(Request $request)
     {
         $me = $request->user();
         $q = $request->validate([
             'os' => ['sometimes', Rule::in(['linux', 'windows'])],
-            'status' => ['sometimes', Rule::in(['healthy', 'failing', 'pending_test', 'unknown'])],
+            'status' => ['sometimes', Rule::in(['healthy', 'failing', 'pending_test', 'test_overdue', 'unknown'])],
             'criticality' => ['sometimes', Rule::in(['critical', 'standard', 'non-critical'])],
             'search' => ['sometimes', 'string', 'max:100'],
         ]);
@@ -42,11 +42,11 @@ class ServerController extends Controller
             $query->where('hostname', 'like', '%'.addcslashes($q['search'], '%_\\').'%');
         }
         if (isset($q['status'])) {
-            $query->whereRaw('('.Server::STATUS_SQL.') = ?', [$q['status']]);
+            $query->whereRaw('('.Server::statusSql().') = ?', [$q['status']]);
         }
         Scope::technician($query, $me, 'servers.id');
         [$column, $dir] = Page::order($request, ['hostname' => 'servers.hostname', 'status' => 'status', 'last_backup' => 'servers.last_backup_time', 'last_test' => 'servers.last_test_time'], 'hostname');
-        $column === 'status' ? $query->orderByRaw('('.Server::STATUS_SQL.") $dir") : $query->orderBy($column, $dir);
+        $column === 'status' ? $query->orderByRaw('('.Server::statusSql().") $dir") : $query->orderBy($column, $dir);
         $query->orderBy('servers.id');
         [$rows, $pagination] = Page::run($request, $query);
 
@@ -76,7 +76,6 @@ class ServerController extends Controller
             'criticality' => ['sometimes', Rule::in(['critical', 'standard', 'non-critical'])],
             'backup_methods' => ['sometimes', 'array', 'max:'.count(Constants::BACKUP_METHODS)],
             'backup_methods.*' => [Rule::in(Constants::BACKUP_METHODS)],
-            'backup_location_path' => ['sometimes', 'nullable', 'string', 'max:512'],
             'retention_policy_days' => ['sometimes', 'nullable', 'integer:strict', 'min:1'],
             'notes' => ['sometimes', 'nullable', 'string', 'max:5000'],
         ];

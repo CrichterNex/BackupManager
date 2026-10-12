@@ -19,6 +19,12 @@ class AgentController extends Controller
             'actions.*.type' => ['required', Rule::in(['command', 'restore_test'])],
             // True while the agent is running a command: it is only checking in, so no new command is handed out.
             'busy' => ['sometimes', 'boolean:strict'],
+            // Location keys the agent can map to a local path.
+            'locations' => ['sometimes', 'array', 'max:100'],
+            'locations.*' => ['string', 'regex:/^[a-z0-9]+(-[a-z0-9]+)*$/', 'max:100'],
+            // Folders the agent allows itself to read when comparing a backup with its source.
+            'source_roots' => ['sometimes', 'array', 'max:50'],
+            'source_roots.*' => ['string', 'max:512'],
         ]);
         foreach (array_keys($data['actions'] ?? []) as $name) {
             if (! is_string($name) || ! preg_match('/^[A-Za-z0-9._-]{1,100}$/', $name)) {
@@ -29,7 +35,7 @@ class AgentController extends Controller
         $cmd = AgentService::poll($agent, $data);
 
         return response()->json(['success' => true, 'command' => $cmd ? [
-            'id' => $cmd->id, 'type' => $cmd->type, 'action' => $cmd->action, 'deadline_at' => $cmd->deadline_at,
+            'id' => $cmd->id, 'type' => $cmd->type, 'action' => $cmd->action, 'location' => $cmd->location_key, 'subpath' => $cmd->location_subpath, 'source' => $cmd->payload, 'deadline_at' => $cmd->deadline_at,
         ] : null]);
     }
 
@@ -47,6 +53,8 @@ class AgentController extends Controller
             'details.failed_item' => ['sometimes', 'nullable', 'string', 'max:500'],
             'details.error_message' => ['sometimes', 'nullable', 'string', 'max:2000'],
             'details.failure_type' => ['sometimes', 'nullable', 'string', 'max:50'],
+            'details.source_status' => ['sometimes', 'nullable', 'in:verified,mismatch,not_comparable'],
+            'details.source_note' => ['sometimes', 'nullable', 'string', 'max:500'],
             'details.severity' => ['sometimes', 'nullable', 'string', 'max:20'],
         ]);
         $cmd = AgentService::handleResult($agent, $id, $r);

@@ -113,6 +113,7 @@ final class ReportRenderer
                 ['Tests run', self::esc($t['run'])], ['Passed', self::esc($t['passed'])], ['Failed', self::esc($t['failed'])], ['Skipped (not run)', self::esc($t['skipped'])],
                 ['Pass rate', self::val($t['pass_rate_pct'], '%')],
                 ['Hash-verified', self::esc($t['hash_checked']).' tests, '.self::esc($t['hash_mismatches']).' mismatch(es)'],
+                ['Compared with the source file', self::esc($t['source_verified'] ?? 0).' matched, '.self::esc($t['source_mismatch'] ?? 0).' differed, '.self::esc($t['source_not_comparable'] ?? 0).' could not be compared (source changed, gone or not readable)'],
                 ['Verification method', self::esc($s['verification_method'])],
             ]).self::table(['Test type', 'Run', 'Passed'], array_map(fn ($x) => [self::label($x['test_type']), self::esc($x['run']), self::esc($x['passed'])], $t['by_type']), 'No tests completed in this period.')),
             self::section('Failures and resolution', self::kv([['Raised in period', self::esc($f['raised'])], ['Resolved', self::esc($f['resolved'])], ['Mean time to resolve', self::val($f['mttr_hours'], ' hours')]])
@@ -170,9 +171,9 @@ final class ReportRenderer
                 ['Rule', 'Latest backup succeeded within '.self::esc($s['params']['max_backup_age_hours']).' hours, latest test passed within '.self::esc($s['params']['max_test_age_days']).' days, and no unresolved critical or high failures.'],
                 ['Last full recovery test', $s['last_full_recovery_test'] ? self::date($s['last_full_recovery_test']) : '<span class="muted">None recorded</span>'],
             ])),
-            self::section('Server readiness', self::table(['Server', 'OS', 'Last backup', 'Last test', 'Ready', 'Why not'],
+            self::section('Server readiness', self::table(['Server', 'OS', 'Backs up (as stated)', 'Last backup', 'Last test', 'Ready', 'Why not'],
                 array_map(fn ($v) => [
-                    self::esc($v['hostname']), self::esc($v['os_type']),
+                    self::esc($v['hostname']), self::esc($v['os_type']), isset($v['scope']) && $v['scope'] ? self::esc($v['scope']) : '<span class="muted">Not stated</span>',
                     self::date($v['last_backup_time']).($v['last_backup_status'] ? ' ('.self::esc($v['last_backup_status']).')' : ''),
                     self::date($v['last_test_time']).($v['last_test_status'] ? ' ('.self::esc($v['last_test_status']).')' : ''),
                     self::badge($v['ready'] ? 'Yes' : 'No', $v['ready'] ? 'good' : 'bad'), self::esc(implode('; ', $v['reasons'])),
