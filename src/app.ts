@@ -10,6 +10,7 @@ import { errorHandler, notFoundHandler, requestId } from './errors.js';
 import { authRouter, meRouter } from './routes/auth.js';
 import { jobsRouter } from './routes/jobs.js';
 import { auditRouter, dashboardRouter, notificationsRouter } from './routes/misc.js';
+import { reportsRouter } from './routes/reports.js';
 import { serversRouter } from './routes/servers.js';
 import { testsRouter } from './routes/tests.js';
 import { usersRouter } from './routes/users.js';
@@ -49,6 +50,7 @@ export function createApp() {
   api.use('/backup-jobs', jobsRouter);
   api.use('/notifications', notificationsRouter);
   api.use('/audit', auditRouter);
+  api.use('/reports', reportsRouter);
   api.use('/', testsRouter);
   api.use('/', dashboardRouter);
   api.use(notFoundHandler);

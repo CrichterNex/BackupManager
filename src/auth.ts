@@ -83,6 +83,8 @@ export const PERMISSIONS = {
   'tests:run': ['company_admin', 'company_technician'],
   'failures:resolve': ['company_admin', 'company_technician'],
   'users:manage': ['company_admin'],
+  'reports:read': ['company_admin', 'company_manager'],
+  'reports:generate': ['company_admin', 'company_manager'],
   'audit:read': ['company_admin'],
   'dashboard:read': ['company_admin', 'company_manager', 'company_technician'],
 } as const satisfies Record<string, readonly Role[]>;

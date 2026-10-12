@@ -72,9 +72,27 @@ Runs inside the app process (set `ENGINE_ENABLED=false` to turn it off) and tick
 - Anything the engine cannot run (other test types, vendor methods, no path) is recorded as **skipped** with the
   reason. It is never counted as a pass.
 
+## Reports (Phase 4)
+
+Four reports, under **Reports** in the UI (admins and managers) and `/api/reports`: compliance, SLA performance,
+security and access, and DR readiness. Generating one saves a frozen snapshot (table `reports`), so the same figures
+can be reopened later. `GET /api/reports/:id/view` is a print-ready page; use the browser's Print, then Save as PDF.
+
+- **Only recorded data.** Anything the blueprint mockups show that BMS cannot measure (uptime, RTO and RPO actuals,
+  encryption, storage use, service credits, framework attestations, DR documentation) is not filled in. Each report
+  ends with a "Not measured by BMS" list instead.
+- **Compliance level** is rule-based: non-compliant if backup success, test coverage or test pass rate is under
+  target (99%, 95%, 95% by default, overridable per request) or a critical or high failure is unresolved;
+  compliant with notes if only lower-severity failures are open; insufficient data if no backups or no tests
+  finished in the period.
+- **DR readiness** per server: latest backup succeeded within 24 hours, latest test passed within 30 days, and no
+  unresolved critical or high failures. Both limits can be overridden.
+- **Automatic:** the engine archives last month's compliance report and last quarter's SLA report once each.
+- Managers can generate reports as well as read them, which the permission matrix did not cover. Technicians cannot.
+
 ## Not built yet
 
 - LDAP login (users can be created as `ldap`, but logging in returns a clear "not configured" error)
-- Backup method integrations (Veeam, Commvault, Acronis, M365, AWS, Azure), the other seven test types, email/SMS/Slack delivery, reports and
-  PDF export, document upload for failures (Phases 2 to 4)
+- Backup method integrations (Veeam, Commvault, Acronis, M365, AWS, Azure), the other seven test types, email/SMS/Slack delivery (including emailing reports),
+  server-side PDF files, the tender response pack, digital signatures, document upload for failures
 - Mobile app

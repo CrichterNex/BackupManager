@@ -14,10 +14,13 @@ const PAGES = [
   { id: 'servers', title: 'Servers', render: servers },
   { id: 'backups', title: 'Backups', render: backups },
   { id: 'tests', title: 'Tests', render: tests },
+  { id: 'reports', title: 'Reports', render: reports, noTechnician: true },
   { id: 'users', title: 'Users', render: users, admin: true },
   { id: 'audit', title: 'Audit log', render: auditLog, admin: true },
   { id: 'profile', title: 'My profile', render: profile },
 ];
+
+const visible = (p) => (!p.admin || isAdmin()) && (!p.noTechnician || me.role !== 'company_technician');
 
 const root = document.getElementById('app');
 let unread = 0;
@@ -25,7 +28,7 @@ let unread = 0;
 // --- routing. One company per user, so the slug in the URL is informational and always their own. ---
 function currentPage() {
   const last = location.pathname.split('/').filter(Boolean).pop();
-  return PAGES.find((p) => p.id === last && (!p.admin || isAdmin())) ?? PAGES[0];
+  return PAGES.find((p) => p.id === last && visible(p)) ?? PAGES[0];
 }
 function go(id) { history.pushState({}, '', `/companies/${me.company.company_slug}/${id}`); show(); }
 window.addEventListener('popstate', () => me && show());
@@ -45,7 +48,7 @@ async function show() {
 function sidebar(page) {
   return h('nav', { class: 'side', 'aria-label': 'Main' },
     h('div', { class: 'brand' }, h('strong', {}, me.company.company_name), h('span', {}, `${ROLE_LABEL[me.role]} · ${me.user.username}`)),
-    PAGES.filter((p) => !p.admin || isAdmin()).map((p) =>
+    PAGES.filter(visible).map((p) =>
       h('a', { class: `nav${p.id === page.id ? ' active' : ''}`, href: `/companies/${me.company.company_slug}/${p.id}`, 'aria-current': p.id === page.id ? 'page' : false,
         onclick: (e) => { e.preventDefault(); go(p.id); } }, p.title)),
     h('a', { class: 'nav', href: '#', id: 'bell', onclick: (e) => { e.preventDefault(); notifications(); } }, 'Notifications', h('span', { class: 'badge info', id: 'bell-count', hidden: true }, '0')),
@@ -271,6 +274,40 @@ async function resolveForm(failure) {
     onSubmit: (v) => api('POST', `/test-failures/${failure.id}/resolve`, { resolution_type: v.resolution_type, backup_usable: v.backup_usable === 'true', notes: v.notes }),
   });
   if (done) { toast('Failure resolved'); show(); }
+}
+
+// --- reports (admin, manager) ---
+const REPORT_LABEL = { compliance: 'Compliance', sla: 'SLA performance', security: 'Security and access', dr_readiness: 'DR readiness' };
+const DAY_MS = 86400000;
+const PERIODS = {
+  last_month: { label: 'Last calendar month', range: () => { const n = new Date(); return [Date.UTC(n.getUTCFullYear(), n.getUTCMonth() - 1, 1), Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1)]; } },
+  last_quarter: { label: 'Last calendar quarter', range: () => { const n = new Date(); const q = Math.floor(n.getUTCMonth() / 3); return [Date.UTC(n.getUTCFullYear(), (q - 1) * 3, 1), Date.UTC(n.getUTCFullYear(), q * 3, 1)]; } },
+  last_30: { label: 'Last 30 days', range: () => [Date.now() - 30 * DAY_MS, Date.now()] },
+  last_90: { label: 'Last 90 days', range: () => [Date.now() - 90 * DAY_MS, Date.now()] },
+};
+async function reports() {
+  const r = await api('GET', '/reports?limit=100');
+  return h('div', {}, topbar('Reports', 'Each report is saved as a snapshot. Open one and use your browser’s Print, then Save as PDF.', h('button', { class: 'primary', onclick: reportForm }, 'Generate report')),
+    card(null, table([
+      { title: 'Report', render: (x) => REPORT_LABEL[x.report_type] },
+      { title: 'Period', render: (x) => (x.report_type === 'dr_readiness' ? 'As at generation' : `${fmtDate(x.period_start)} to ${fmtDate(new Date(new Date(x.period_end) - 1))}`) },
+      { title: 'Generated', render: (x) => `${fmtDate(x.created_at)}${x.generated_by ? '' : ' (automatic)'}` },
+      { title: '', render: (x) => h('a', { href: `/api/reports/${x.id}/view`, target: '_blank', rel: 'noopener' }, 'Open') },
+    ], r.data, { empty: 'No reports yet. Generate one, or wait for the monthly and quarterly ones.' })));
+}
+async function reportForm() {
+  const done = await formModal({
+    title: 'Generate report', submitLabel: 'Generate',
+    fields: [
+      { name: 'report_type', label: 'Report', type: 'select', options: Object.entries(REPORT_LABEL).map(([value, label]) => ({ value, label })) },
+      { name: 'period', label: 'Period', type: 'select', options: Object.entries(PERIODS).map(([value, p]) => ({ value, label: p.label })), hint: 'Ignored for DR readiness, which is a snapshot of right now.' },
+    ],
+    onSubmit: (v) => {
+      const [from, to] = PERIODS[v.period].range();
+      return api('POST', '/reports', v.report_type === 'dr_readiness' ? { report_type: v.report_type } : { report_type: v.report_type, period_start: new Date(from).toISOString(), period_end: new Date(to).toISOString() });
+    },
+  });
+  if (done) { toast('Report generated'); show(); }
 }
 
 // --- users (admin) ---

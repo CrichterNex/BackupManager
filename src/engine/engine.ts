@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { ENGINE_TEST_TYPES, FILESYSTEM_METHODS } from '../constants.js';
 import { pool, withCompany, withTransaction } from '../db.js';
 import { notifyRoles, recordTestResult, skipTest, type TestResult } from '../services.js';
+import { generateScheduledReports } from '../reports/service.js';
 import { runRandomRestore } from './runners.js';
 
 // Only one engine instance acts at a time, even if several app processes are running.
@@ -141,7 +142,7 @@ export async function escalateFailures(companyId: number): Promise<number> {
 }
 
 /** One full pass: queue due tests, run what is due, escalate stale failures. Safe to call from several processes. */
-export async function engineTick(): Promise<{ queued: number; ran: number; escalated: number } | undefined> {
+export async function engineTick(): Promise<{ queued: number; ran: number; escalated: number; reports: number } | undefined> {
   const lock = await pool.connect();
   try {
     const got = (await lock.query('SELECT pg_try_advisory_lock($1) AS ok', [ENGINE_LOCK])).rows[0].ok;
@@ -153,7 +154,8 @@ export async function engineTick(): Promise<{ queued: number; ran: number; escal
         ran += await runDueTests(id);
         escalated += await escalateFailures(id);
       }
-      return { queued, ran, escalated };
+      const reports = await generateScheduledReports();
+      return { queued, ran, escalated, reports };
     } finally {
       await lock.query('SELECT pg_advisory_unlock($1)', [ENGINE_LOCK]);
     }
@@ -170,7 +172,7 @@ async function safeTick() {
   running = true;
   try {
     const r = await engineTick();
-    if (r && (r.queued || r.ran || r.escalated)) console.log(`Test engine: queued ${r.queued}, ran ${r.ran}, escalated ${r.escalated}`);
+    if (r && (r.queued || r.ran || r.escalated || r.reports)) console.log(`Engine: queued ${r.queued}, ran ${r.ran}, escalated ${r.escalated}, reports ${r.reports}`);
   } catch (err) {
     console.error('Test engine error:', (err as Error).message);
   } finally {

@@ -8,7 +8,7 @@ export const app = createApp();
 export const PASSWORD = 'correct-horse-battery';
 
 export async function resetDb() {
-  await pool.query(`TRUNCATE notifications, server_assignments, backup_test_failures, backup_test_executions,
+  await pool.query(`TRUNCATE reports, notifications, server_assignments, backup_test_failures, backup_test_executions,
     backup_jobs, servers, audit_trail, users, companies RESTART IDENTITY CASCADE`);
 }
 

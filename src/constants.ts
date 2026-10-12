@@ -13,3 +13,6 @@ export const FILESYSTEM_METHODS = ['rsync', 'windows_manual_copy', 'linux_manual
 
 /** Test types the engine can actually run today. Everything else is recorded as skipped, never as a pass. */
 export const ENGINE_TEST_TYPES = ['random_restore'] as const;
+
+export const REPORT_TYPES = ['compliance', 'sla', 'security', 'dr_readiness'] as const;
+export type ReportType = (typeof REPORT_TYPES)[number];
