@@ -115,6 +115,82 @@ class PlatformTest extends TestCase
         $this->assertFalse($this->admin->get('/api/me')->json('data.platform_admin'));
     }
 
+    // --- working inside other companies ---
+
+    private function customerId(): int
+    {
+        return (int) DB::table('companies')->where('slug', 'customer')->value('id');
+    }
+
+    public function test_by_default_a_platform_admin_sees_only_their_own_company(): void
+    {
+        $this->admin->post('/api/servers', ['hostname' => 'cust-01', 'os_type' => 'linux']);
+        $this->assertSame([], $this->platform->get('/api/servers')->json('data'));
+        $this->assertSame('operator', $this->platform->get('/api/me')->json('data.company_slug'));
+    }
+
+    public function test_a_platform_admin_can_work_inside_any_company(): void
+    {
+        $this->admin->post('/api/servers', ['hostname' => 'cust-01', 'os_type' => 'linux']);
+        $inside = $this->platform->inCompany($this->customerId());
+        $this->assertSame(['cust-01'], collect($inside->get('/api/servers')->json('data'))->pluck('hostname')->all());
+        $this->assertSame(['custadmin'], collect($inside->get('/api/users')->json('data'))->pluck('username')->all());
+        $me = $inside->get('/api/me')->json('data');
+        $this->assertSame('customer', $me['company_slug']);
+        $this->assertTrue($me['acting_in_other_company']);
+        $this->assertSame('operator', $me['home_company']['slug']);
+    }
+
+    public function test_changes_made_inside_land_in_that_company_and_are_audited_there(): void
+    {
+        $inside = $this->platform->inCompany($this->customerId());
+        $this->assertSame(201, $inside->post('/api/servers', ['hostname' => 'made-by-platform', 'os_type' => 'linux'])->status());
+        $this->assertSame(1, DB::table('servers')->where('hostname', 'made-by-platform')->where('company_id', $this->customerId())->count());
+        $this->assertSame(0, DB::table('servers')->where('hostname', 'made-by-platform')->where('company_id', $this->homeId)->count());
+
+        // The customer's own admin can see who did it, in the customer's own audit log.
+        $entry = collect($this->admin->get('/api/audit?action=server_created')->json('data'))->firstWhere('username', 'root');
+        $this->assertNotNull($entry);
+        $this->assertTrue($entry['details']['via_platform_admin']);
+        $this->assertSame($this->homeId, $entry['details']['home_company_id']);
+        $this->assertCount(0, collect($this->platform->get('/api/audit?action=server_created')->json('data')), 'not in the home trail');
+    }
+
+    public function test_entering_a_company_is_recorded_in_its_audit_log(): void
+    {
+        $this->assertSame(200, $this->platform->post('/api/platform/companies/'.$this->customerId().'/enter')->status());
+        $rows = $this->admin->get('/api/audit?action=platform_access_started')->json('data');
+        $this->assertCount(1, $rows);
+        $this->assertSame('root', $rows[0]['username']);
+        $this->platform->post('/api/platform/companies/'.$this->homeId.'/enter');
+        $this->assertSame(0, DB::table('audit_trail')->where('action', 'platform_access_started')->where('company_id', $this->homeId)->count(), 'entering your own company is not an event');
+        $this->assertSame(404, $this->platform->post('/api/platform/companies/99999/enter')->status());
+        $this->assertSame(403, $this->admin->post('/api/platform/companies/'.$this->homeId.'/enter')->status());
+    }
+
+    public function test_nobody_else_can_use_the_acting_header_and_it_is_refused_not_ignored(): void
+    {
+        $this->admin->post('/api/servers', ['hostname' => 'cust-01', 'os_type' => 'linux']);
+        $home = (int) DB::table('companies')->where('slug', 'operator')->value('id');
+        $this->assertSame(403, $this->admin->inCompany($home)->get('/api/servers')->status());
+        $this->assertSame(403, $this->admin->inCompany($home)->get('/api/me')->status());
+        $id = DB::table('users')->where('username', 'root')->value('id');
+        DB::table('users')->where('id', $id)->update(['role' => 'company_manager']);
+        $this->assertSame(403, $this->platform->inCompany($this->customerId())->get('/api/servers')->status());
+    }
+
+    public function test_an_unknown_acting_company_is_404_not_a_silent_fallback(): void
+    {
+        $this->assertSame(404, $this->platform->inCompany(99999)->get('/api/servers')->status());
+    }
+
+    public function test_the_context_resets_between_requests(): void
+    {
+        $this->admin->post('/api/servers', ['hostname' => 'cust-01', 'os_type' => 'linux']);
+        $this->assertCount(1, $this->platform->inCompany($this->customerId())->get('/api/servers')->json('data'));
+        $this->assertCount(0, $this->platform->get('/api/servers')->json('data'), 'the next request is back in the home company');
+    }
+
     public function test_the_operator_command_grants_and_revokes_the_flag(): void
     {
         $this->artisan('bms:platform-admin custadmin')->expectsOutputToContain('now a platform admin')->assertSuccessful();

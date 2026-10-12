@@ -13,6 +13,7 @@ final class Permissions
         'jobs:read' => self::ALL,
         'jobs:write' => ['company_admin'],
         'backups:run' => ['company_admin'],
+        'integrations:manage' => ['company_admin'],
         'tests:read' => self::ALL,
         'tests:run' => ['company_admin', 'company_technician'],
         'failures:resolve' => ['company_admin', 'company_technician'],

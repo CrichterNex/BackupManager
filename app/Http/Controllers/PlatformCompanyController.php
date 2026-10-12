@@ -6,6 +6,7 @@ use App\Models\Company;
 use App\Models\User;
 use App\Services\Audit;
 use App\Support\ApiException;
+use App\Support\CompanyContext;
 use App\Support\Passwords;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -28,6 +29,20 @@ class PlatformCompanyController extends Controller
         ]);
 
         return response()->json(['success' => true, 'data' => $rows]);
+    }
+
+    /**
+     * Start working inside a company. The UI then sends X-Acting-Company on every call. This records the entry in
+     * the company's own audit trail, so its admins can see that a platform admin came in, and when.
+     */
+    public function enter(Request $request, int $id)
+    {
+        $company = Company::find($id) ?? throw ApiException::notFound('Company', 'COMPANY_001');
+        if ($company->id !== $request->user()->company_id) {
+            CompanyContext::run($company->id, fn () => DB::transaction(fn () => Audit::log($request, 'platform_access_started', 'company', $company->id)));
+        }
+
+        return response()->json(['success' => true, 'data' => ['id' => $company->id, 'name' => $company->name, 'slug' => $company->slug]]);
     }
 
     public function store(Request $request)

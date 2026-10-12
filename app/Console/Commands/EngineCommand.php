@@ -19,8 +19,8 @@ class EngineCommand extends Command
 
             return self::SUCCESS;
         }
-        if ($r['queued'] || $r['ran'] || $r['escalated'] || $r['reports'] || $r['expired'] || $r['backups']) {
-            $this->info("Engine: queued {$r['queued']}, ran {$r['ran']}, escalated {$r['escalated']}, reports {$r['reports']}, agent backups queued {$r['backups']}, agent commands expired {$r['expired']}");
+        if ($r['queued'] || $r['ran'] || $r['escalated'] || $r['reports'] || $r['expired'] || $r['backups'] || $r['synced']) {
+            $this->info("Engine: queued {$r['queued']}, ran {$r['ran']}, escalated {$r['escalated']}, reports {$r['reports']}, agent backups queued {$r['backups']}, agent commands expired {$r['expired']}, platform syncs {$r['synced']}");
         }
 
         return self::SUCCESS;

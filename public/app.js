@@ -1,4 +1,4 @@
-import { api, h, setUnauthorizedHandler, toast, errMessage, badge, table, label, fmtAgo, fmtDate, formModal, confirmModal } from './lib.js';
+import { api, getActing, setActing, h, setUnauthorizedHandler, toast, errMessage, badge, table, label, fmtAgo, fmtDate, formModal, confirmModal } from './lib.js';
 
 const METHODS = ['rsync', 'acronis', 'veeam', 'commvault', 'windows_manual_copy', 'linux_manual_copy', 'acronis_m365', 'microsoft_native_365', 'aws_backup', 'azure_backup'];
 const TEST_TYPES = ['synthetic_file', 'random_restore', 'full_recovery', 'database_integrity', 'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions'];
@@ -16,6 +16,7 @@ const PAGES = [
   { id: 'tests', title: 'Tests', render: tests },
   { id: 'reports', title: 'Reports', render: reports, noTechnician: true },
   { id: 'users', title: 'Users', render: users, admin: true },
+  { id: 'integrations', title: 'Integrations', render: integrations, admin: true },
   { id: 'companies', title: 'Companies', render: companies, platform: true },
   { id: 'audit', title: 'Audit log', render: auditLog, admin: true },
   { id: 'profile', title: 'My profile', render: profile },
@@ -49,6 +50,8 @@ async function show() {
 function sidebar(page) {
   return h('nav', { class: 'side', 'aria-label': 'Main' },
     h('div', { class: 'brand' }, h('strong', {}, me.company.company_name), h('span', {}, `${ROLE_LABEL[me.role]} · ${me.user.username}`)),
+    me.acting && h('div', { class: 'error', role: 'status', style: 'margin:8px 0' }, `Working inside ${me.company.company_name} as a platform admin. Your changes are recorded in its audit log. `,
+      h('button', { class: 'link', onclick: () => { setActing(null); location.assign('/'); } }, 'Back to my company')),
     PAGES.filter(visible).map((p) =>
       h('a', { class: `nav${p.id === page.id ? ' active' : ''}`, href: `/companies/${me.company.company_slug}/${p.id}`, 'aria-current': p.id === page.id ? 'page' : false,
         onclick: (e) => { e.preventDefault(); go(p.id); } }, p.title)),
@@ -90,7 +93,7 @@ function loginScreen() {
   user.focus();
 }
 
-async function logout() { await api('POST', '/auth/logout').catch(() => {}); history.replaceState({}, '', '/'); loginScreen(); }
+async function logout() { await api('POST', '/auth/logout').catch(() => {}); setActing(null); history.replaceState({}, '', '/'); loginScreen(); }
 setUnauthorizedHandler(() => { if (me) { toast('Your session has ended. Please log in again.', true); history.replaceState({}, '', '/'); loginScreen(); } });
 
 // --- dashboard ---
@@ -176,7 +179,7 @@ async function serverDetail(s) {
       row('Health', badge(full.status)), row('OS', label(full.os_type)), row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
       row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
       row('Last backup', `${label(full.last_backup_status)} · ${fmtDate(full.last_backup_time)}`), row('Last test', `${label(full.last_test_status)} · ${fmtDate(full.last_test_time)}`),
-      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), row('Agent', agentSummary(full.agent)), row('Notes', full.notes ?? '—'))),
+      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), row('Agent', agentSummary(full.agent)), row('Platforms', linksSummary(full.links)), row('Notes', full.notes ?? '—'))),
     h('div', { class: 'actions' },
       isAdmin() && h('button', { class: 'danger', onclick: async () => {
         if (await confirmModal('Delete server?', `${full.hostname} and its backup jobs will be removed from view. History is kept for audit.`, 'Delete')) {
@@ -185,10 +188,47 @@ async function serverDetail(s) {
       isAdmin() && (full.agent.enrolled
         ? h('button', { onclick: async () => { if (await confirmModal('Remove agent?', `${full.hostname} will stop receiving backup and test commands. The agent software on the server keeps running until you stop it.`, 'Remove') && await act(() => api('DELETE', `/servers/${full.id}/agent`), 'Agent removed')) { overlay.remove(); show(); } } }, 'Remove agent')
         : h('button', { onclick: () => { overlay.remove(); enrollAgent(full); } }, 'Enroll agent')),
+      isAdmin() && h('button', { onclick: () => { overlay.remove(); linkForm(full); } }, 'Link to platform device'),
+      isAdmin() && full.links.length > 0 && h('button', { onclick: async () => {
+        if (await confirmModal('Remove platform link?', 'BMS will stop reading backup status for this server from the platform. Past results stay.', 'Remove')
+          && await act(async () => { for (const l of full.links) await api('DELETE', `/servers/${full.id}/links/${l.id}`); }, 'Link removed')) { overlay.remove(); show(); } } }, 'Remove platform link'),
       isAdmin() && h('button', { onclick: async () => { overlay.remove(); await assignForm(full, techs, assigned); } }, 'Assign technicians'),
       isAdmin() && h('button', { onclick: () => { overlay.remove(); serverForm(full); } }, 'Edit'),
       h('button', { class: 'primary', onclick: () => overlay.remove() }, 'Close'))));
   document.body.append(overlay);
+}
+const linksSummary = (links) => (links.length
+  ? h('span', {}, links.map((l) => h('div', {},
+    `${l.integration.name}: ${l.external_name ?? l.external_id} · ${l.last_status ? label(l.last_status) : 'not read yet'}`,
+    l.last_success_at ? ` · last success ${fmtAgo(l.last_success_at)}` : '',
+    l.sync_error ? h('div', { class: 'small' }, l.sync_error) : '')))
+  : 'None');
+async function linkForm(server) {
+  let list;
+  try { list = (await api('GET', '/integrations')).data; } catch (e) { return toast(errMessage(e), true); }
+  if (!list.length) return toast('Add a platform connection first, on the Integrations page.', true);
+  let integrationId = String(list[0].id);
+  if (list.length > 1) {
+    const chosen = await new Promise((resolve) => {
+      formModal({
+        title: `Link ${server.hostname}`, submitLabel: 'Next',
+        fields: [{ name: 'integration_id', label: 'Platform connection', type: 'select', options: list.map((i) => ({ value: String(i.id), label: i.name })) }],
+        onSubmit: async (v) => { resolve(v.integration_id); },
+      }).then(() => resolve(null));
+    });
+    if (!chosen) return;
+    integrationId = chosen;
+  }
+  let devices;
+  try { devices = (await api('GET', `/integrations/${integrationId}/devices`)).data; } catch (e) { return toast(errMessage(e), true); }
+  const free = devices.filter((d) => !d.linked_server_id);
+  if (!free.length) return toast('Every device on that connection is already linked, or none were found.', true);
+  const done = await formModal({
+    title: `Link ${server.hostname} to a device`, submitLabel: 'Link',
+    fields: [{ name: 'external_id', label: 'Device on the platform', type: 'select', options: free.map((d) => ({ value: d.id, label: `${d.name}${d.status ? ` (${d.status})` : ''}` })), hint: 'BMS will read this device’s backup status from the platform.' }],
+    onSubmit: (v) => api('POST', `/servers/${server.id}/links`, { integration_id: Number(integrationId), external_id: v.external_id }),
+  });
+  if (done) { toast('Linked. Status read from the platform.'); show(); }
 }
 const agentSummary = (a) => {
   if (!a.enrolled) return 'Not enrolled';
@@ -338,15 +378,58 @@ async function reportForm() {
   if (done) { toast('Report generated'); show(); }
 }
 
+// --- integrations (admin) ---
+async function integrations() {
+  const r = await api('GET', '/integrations');
+  const sync = (i) => async () => {
+    const res = await api('POST', `/integrations/${i.id}/sync`).catch((e) => ({ success: false, data: { error: errMessage(e) } }));
+    toast(res.success ? 'Synced' : `Sync failed: ${res.data.error}`, !res.success);
+    show();
+  };
+  return h('div', {}, topbar('Integrations', 'Connections to external backup platforms. BMS reads backup status for servers you link to a device, and never changes anything on the platform.', h('button', { class: 'primary', onclick: integrationForm }, 'Add Acronis connection')),
+    card(null, table([
+      { title: 'Name', render: (i) => i.name }, { title: 'Platform', render: (i) => label(i.platform) }, { title: 'Datacenter', render: (i) => i.base_url.replace('https://', '') },
+      { title: 'Client', render: (i) => h('code', {}, i.client_id_hint ?? '—') }, { title: 'Linked servers', render: (i) => i.links },
+      { title: 'Last sync', render: (i) => (i.last_sync_status === 'error'
+        ? h('span', {}, badge('failed', 'Error'), h('div', { class: 'small' }, i.last_sync_error))
+        : i.last_sync_at ? h('span', {}, badge('success', 'OK'), ` ${fmtAgo(i.last_sync_at)}`) : 'Not yet') },
+      { title: '', render: (i) => h('span', { class: 'row' },
+        h('button', { class: 'link', onclick: async () => { if (await act(() => api('POST', `/integrations/${i.id}/test`))) toast('Connection works'); } }, 'Test'),
+        h('button', { class: 'link', onclick: sync(i) }, 'Sync now'),
+        h('button', { class: 'link', onclick: async () => { if (await confirmModal('Remove connection?', `${i.name} and the links from servers to its devices are removed. Backup history stays.`, 'Remove') && await act(() => api('DELETE', `/integrations/${i.id}`), 'Connection removed')) show(); } }, 'Remove')) },
+    ], r.data, { empty: 'No connections yet. Add one to read backup status from Acronis.' })));
+}
+async function integrationForm() {
+  const done = await formModal({
+    title: 'Add Acronis connection', submitLabel: 'Connect',
+    fields: [
+      { name: 'name', label: 'Name', required: true, value: 'Acronis' },
+      { name: 'base_url', label: 'Datacenter URL', required: true, hint: 'The address of your Acronis console, e.g. https://eu2-cloud.acronis.com' },
+      { name: 'client_id', label: 'API client ID', required: true },
+      { name: 'client_secret', label: 'API client secret', type: 'password', required: true, hint: 'Create an API client in the Acronis console with a read-only role. The secret is stored encrypted and never shown again.' },
+      { name: 'stale_after_hours', label: 'Warn when no successful backup for (hours)', type: 'number', value: '36' },
+    ],
+    onSubmit: (v) => api('POST', '/integrations', { platform: 'acronis', name: v.name.trim(), base_url: v.base_url.trim(), client_id: v.client_id.trim(), client_secret: v.client_secret, stale_after_hours: Number(v.stale_after_hours) || 36 }),
+  });
+  if (done) { toast('Connected. Now link servers to their devices from each server.'); show(); }
+}
+
 // --- companies (platform admins only) ---
 async function companies() {
   const r = await api('GET', '/platform/companies');
-  return h('div', {}, topbar('Companies', 'Every company on this system. You only see counts here, never another company’s records.', h('button', { class: 'primary', onclick: companyForm }, 'Create company')),
+  return h('div', {}, topbar('Companies', 'Every company on this system. Open one to work inside it as its admin. Each visit is recorded in that company’s audit log.', h('button', { class: 'primary', onclick: companyForm }, 'Create company')),
     card(null, table([
       { title: 'Company', render: (c) => c.name }, { title: 'Slug', render: (c) => c.slug }, { title: 'Plan', render: (c) => label(c.subscription_tier) },
       { title: 'Users', render: (c) => c.users }, { title: 'Servers', render: (c) => `${c.servers}${c.max_servers ? ` / ${c.max_servers}` : ''}` },
       { title: 'Status', render: (c) => badge(c.is_active ? 'success' : 'failed', c.is_active ? 'Active' : 'Disabled') }, { title: 'Created', render: (c) => fmtDate(c.created_at) },
+      { title: '', render: (c) => (c.id === me.company.id ? h('span', { class: 'small muted' }, me.acting ? 'Open now' : 'Your company') : h('button', { class: 'link', onclick: () => enterCompany(c) }, 'Open')) },
     ], r.data)));
+}
+async function enterCompany(c) {
+  try { await api('POST', `/platform/companies/${c.id}/enter`); } catch (e) { return toast(errMessage(e), true); }
+  setActing(c.id);
+  history.replaceState({}, '', '/');
+  location.reload();
 }
 async function companyForm() {
   let created = null;
@@ -457,7 +540,7 @@ async function notifications() {
 (async () => {
   try {
     const r = (await api('GET', '/me')).data;
-    me = { user: { username: r.username, email: r.email }, company: { company_name: r.company_name, company_slug: r.company_slug }, role: r.role, platform: r.platform_admin };
+    me = { user: { username: r.username, email: r.email }, company: { id: r.company_id, company_name: r.company_name, company_slug: r.company_slug }, role: r.role, platform: r.platform_admin, acting: r.acting_in_other_company };
     show();
   } catch { loginScreen(); }
 })();

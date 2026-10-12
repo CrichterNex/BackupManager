@@ -13,6 +13,10 @@ return [
     'random_restore_every_days' => (int) env('BMS_RANDOM_RESTORE_EVERY_DAYS', 7),
     'restore_staging_dir' => env('BMS_RESTORE_STAGING_DIR') ?: '',
 
+    // External backup platforms. BMS only ever calls hosts on these domains (guards against pointing it at internal addresses).
+    'integration_allowed_host_suffixes' => array_filter(array_map('trim', explode(',', (string) env('BMS_INTEGRATION_HOST_SUFFIXES', 'acronis.com')))),
+    'integration_sync_minutes' => (int) env('BMS_INTEGRATION_SYNC_MINUTES', 15),
+
     'agent_rate_limit_per_hour' => (int) env('BMS_AGENT_RATE_LIMIT_PER_HOUR', 1200),
 
     'min_password_length' => 12,

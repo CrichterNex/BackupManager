@@ -5,8 +5,10 @@ namespace App\Http\Controllers;
 use App\Models\BackupJob;
 use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
+use App\Models\Company;
 use App\Models\Server;
 use App\Support\ApiException;
+use App\Support\CompanyContext;
 use App\Support\Scope;
 use Illuminate\Http\Request;
 
@@ -75,7 +77,7 @@ class DashboardController extends Controller
         $finished = (int) $jobs->finished;
 
         return [
-            'company' => ['id' => $me->company_id, 'name' => $me->company->name, 'slug' => $me->company->slug],
+            'company' => ['id' => CompanyContext::id(), 'name' => ($company = Company::find(CompanyContext::id()))->name, 'slug' => $company->slug],
             'servers' => ['total' => (int) $srv->total, 'failing' => (int) $srv->failing],
             'backups_30d' => ['finished' => $finished, 'success' => (int) $jobs->success, 'warning' => (int) $jobs->warning, 'failed' => (int) $jobs->failed],
             'tests' => [
@@ -97,7 +99,7 @@ class DashboardController extends Controller
     // Spec path: refuses any company other than the caller's own.
     public function forCompany(Request $request, int $id)
     {
-        if ($id !== $request->user()->company_id) {
+        if ($id !== CompanyContext::id()) {
             throw ApiException::forbidden('Access denied');
         }
 

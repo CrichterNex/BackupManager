@@ -3,9 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Http\Middleware\CookieToken;
+use App\Models\Company;
 use App\Models\User;
 use App\Services\Audit;
 use App\Support\ApiException;
+use App\Support\CompanyContext;
 use App\Support\Passwords;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -74,11 +76,15 @@ class AuthController extends Controller
     public function me(Request $request)
     {
         $u = $request->user();
+        // A platform admin working inside another company is shown that company, with their home company alongside.
+        $company = Company::find(CompanyContext::id());
 
         return response()->json(['success' => true, 'data' => [
             'id' => $u->id, 'username' => $u->username, 'email' => $u->email, 'first_name' => $u->first_name, 'last_name' => $u->last_name,
-            'company_id' => $u->company_id, 'company_name' => $u->company->name, 'company_slug' => $u->company->slug, 'role' => $u->role,
+            'company_id' => $company->id, 'company_name' => $company->name, 'company_slug' => $company->slug, 'role' => $u->role,
             'platform_admin' => (bool) $u->is_platform_admin,
+            'acting_in_other_company' => $company->id !== $u->company_id,
+            'home_company' => ['id' => $u->company_id, 'name' => $u->company->name, 'slug' => $u->company->slug],
         ]]);
     }
 

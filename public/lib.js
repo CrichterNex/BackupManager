@@ -21,6 +21,11 @@ export class ApiError extends Error {
   constructor(status, body) { super(body?.error ?? `Request failed (${status})`); this.status = status; this.body = body; }
 }
 
+// A platform admin working inside another company. Kept per browser tab, so closing the tab returns to their own company.
+export const getActing = () => { try { return sessionStorage.getItem('actingCompany'); } catch { return null; } };
+export const setActing = (id) => { try { id ? sessionStorage.setItem('actingCompany', String(id)) : sessionStorage.removeItem('actingCompany'); } catch { /* storage blocked: stay in the home company */ } };
+const actingHeader = () => (getActing() ? { 'X-Acting-Company': getActing() } : {});
+
 let onUnauthorized = () => {};
 export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn; };
 
@@ -28,7 +33,7 @@ export async function api(method, path, body) {
   const res = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...actingHeader() },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return null;

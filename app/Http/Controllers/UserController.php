@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\User;
 use App\Services\Audit;
 use App\Support\ApiException;
+use App\Support\CompanyContext;
 use App\Support\Passwords;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -21,7 +22,7 @@ class UserController extends Controller
 
     public function index(Request $request)
     {
-        $users = User::where('company_id', $request->user()->company_id)->orderBy('username')->get();
+        $users = User::where('company_id', CompanyContext::id())->orderBy('username')->get();
 
         return response()->json(['success' => true, 'data' => $users->map(fn ($u) => $this->present($u))->values()]);
     }
@@ -41,7 +42,7 @@ class UserController extends Controller
             'company_id' => ['nullable', 'integer'],
         ]);
         // Refuse outright rather than silently overriding another company's id.
-        if (isset($body['company_id']) && (int) $body['company_id'] !== $me->company_id) {
+        if (isset($body['company_id']) && (int) $body['company_id'] !== CompanyContext::id()) {
             throw ApiException::forbidden('You can only create users in your assigned company');
         }
         $method = $body['auth_method'] ?? 'local';
@@ -53,12 +54,12 @@ class UserController extends Controller
             Passwords::assertStrong($body['password']);
             $password = $body['password'];
         }
-        $user = DB::transaction(function () use ($body, $me, $method, $password, $request) {
+        $user = DB::transaction(function () use ($body, $method, $password, $request) {
             if (User::where('username', $body['username'])->exists()) {
                 throw ApiException::conflict('USER_002', 'Username already exists');
             }
             $u = User::create([
-                'company_id' => $me->company_id, 'username' => $body['username'], 'email' => $body['email'],
+                'company_id' => CompanyContext::id(), 'username' => $body['username'], 'email' => $body['email'],
                 'first_name' => $body['first_name'] ?? null, 'last_name' => $body['last_name'] ?? null, 'phone' => $body['phone'] ?? null,
                 'role' => $body['role'], 'auth_method' => $method, 'password' => $password,
                 'ldap_user' => $method === 'ldap' ? $body['username'] : null,
@@ -90,8 +91,8 @@ class UserController extends Controller
         if ($id === $me->id && (array_key_exists('role', $body) || array_key_exists('active', $body))) {
             throw ApiException::badRequest('You cannot change your own role or active status');
         }
-        $user = DB::transaction(function () use ($id, $me, $body, $request) {
-            $u = User::where('company_id', $me->company_id)->lockForUpdate()->find($id);
+        $user = DB::transaction(function () use ($id, $body, $request) {
+            $u = User::where('company_id', CompanyContext::id())->lockForUpdate()->find($id);
             if (! $u) {
                 throw ApiException::notFound('User', 'USER_001');
             }

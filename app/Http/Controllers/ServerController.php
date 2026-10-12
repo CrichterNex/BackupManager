@@ -6,9 +6,11 @@ use App\Models\Agent;
 use App\Models\BackupJob;
 use App\Models\Company;
 use App\Models\Server;
+use App\Models\ServerLink;
 use App\Models\User;
 use App\Services\Audit;
 use App\Support\ApiException;
+use App\Support\CompanyContext;
 use App\Support\Constants;
 use App\Support\Page;
 use App\Support\Scope;
@@ -59,7 +61,7 @@ class ServerController extends Controller
         $assigned = DB::table('server_assignments as a')->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('a.server_id', $server->id)->orderBy('u.username')->get(['u.id', 'u.username']);
 
-        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned, 'agent' => ($agent = Agent::where('server_id', $server->id)->first()) ? $agent->summary() : ['enrolled' => false]]]);
+        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned, 'links' => ServerLink::with('integration:id,name,platform')->where('server_id', $server->id)->get(), 'agent' => ($agent = Agent::where('server_id', $server->id)->first()) ? $agent->summary() : ['enrolled' => false]]]);
     }
 
     private function rules(bool $partial): array
@@ -88,7 +90,7 @@ class ServerController extends Controller
     public function store(Request $request)
     {
         $body = $request->validate($this->rules(false));
-        $company = Company::findOrFail($request->user()->company_id);
+        $company = Company::findOrFail(CompanyContext::id());
         $server = DB::transaction(function () use ($body, $company, $request) {
             // Serialise server creation per company so the subscription limit cannot be raced past.
             Company::whereKey($company->id)->lockForUpdate()->first();
@@ -152,17 +154,17 @@ class ServerController extends Controller
         $data = $request->validate(['user_ids' => ['present', 'array', 'max:100'], 'user_ids.*' => ['integer:strict', 'min:1']]);
         $ids = array_values(array_unique($data['user_ids']));
         $me = $request->user();
-        DB::transaction(function () use ($id, $ids, $me, $request) {
+        DB::transaction(function () use ($id, $ids, $request) {
             Server::where('active', true)->find($id) ?? throw ApiException::notFound('Server', 'SERVER_001');
             if ($ids) {
-                $ok = User::whereIn('id', $ids)->where('company_id', $me->company_id)->where('role', 'company_technician')->where('active', true)->count();
+                $ok = User::whereIn('id', $ids)->where('company_id', CompanyContext::id())->where('role', 'company_technician')->where('active', true)->count();
                 if ($ok !== count($ids)) {
                     throw ApiException::badRequest('All assignees must be active technicians in your company');
                 }
             }
             DB::table('server_assignments')->where('server_id', $id)->delete();
             foreach ($ids as $uid) {
-                DB::table('server_assignments')->insert(['server_id' => $id, 'user_id' => $uid, 'company_id' => $me->company_id]);
+                DB::table('server_assignments')->insert(['server_id' => $id, 'user_id' => $uid, 'company_id' => CompanyContext::id()]);
             }
             Audit::log($request, 'server_assignments_set', 'server', $id, ['user_ids' => $ids]);
         });

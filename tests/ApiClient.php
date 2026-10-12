@@ -8,14 +8,20 @@ use Illuminate\Testing\TestResponse;
 /** A logged-in caller. Each request starts from a clean auth state so one user's identity cannot leak into the next call. */
 final class ApiClient
 {
-    public function __construct(private TestCase $test, public string $token) {}
+    public function __construct(private TestCase $test, public string $token, private ?int $acting = null) {}
+
+    /** The same caller, working inside another company (platform admins only). */
+    public function inCompany(int $companyId): self
+    {
+        return new self($this->test, $this->token, $companyId);
+    }
 
     public function call(string $method, string $url, array $data = []): TestResponse
     {
         Auth::forgetGuards();
         $this->test->flushHeaders();
 
-        return $this->test->withHeaders(['Authorization' => 'Bearer '.$this->token])->json($method, $url, $data);
+        return $this->test->withHeaders(['Authorization' => 'Bearer '.$this->token] + ($this->acting ? ['X-Acting-Company' => (string) $this->acting] : []))->json($method, $url, $data);
     }
 
     public function get(string $url): TestResponse

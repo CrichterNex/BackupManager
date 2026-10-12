@@ -25,8 +25,13 @@ final class Audit
     public static function log(?Request $request, string $action, ?string $resourceType = null, ?int $resourceId = null, ?array $details = null, bool $success = true, ?array $actor = null): void
     {
         $user = $request?->user();
-        $companyId = $actor['company_id'] ?? $user?->company_id ?? CompanyContext::id();
+        // The company in context wins: a platform admin working inside another company is recorded in THAT
+        // company's trail, so its own admins can see who came in and what they changed.
+        $companyId = $actor['company_id'] ?? CompanyContext::id() ?? $user?->company_id;
         $userId = $actor['user_id'] ?? $user?->id;
+        if ($user && ! $actor && $companyId !== null && $user->company_id !== $companyId) {
+            $details = ($details ?? []) + ['via_platform_admin' => true, 'home_company_id' => $user->company_id];
+        }
         $row = [
             'user_id' => $userId,
             'action' => $action,

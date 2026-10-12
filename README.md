@@ -43,11 +43,20 @@ real data.
 - Web UI: dashboard, servers, backups, tests and failure resolution, reports, users, audit log, notifications,
   and a Companies page for platform admins
 
-## Platform admins and creating companies
+## Platform admins
 
-Company admins are limited to their own company. A separate **platform admin** flag lets selected company admins
-create new companies, from **Companies** in the UI (`/api/platform/companies`). That page lists every company with
-user and server counts only, never another company's records.
+Company admins are limited to their own company. A separate **platform admin** flag, set by an operator, gives
+selected company admins two extra abilities from **Companies** in the UI (`/api/platform/companies`):
+
+- **Create companies.** Creating one also creates its first admin. If you leave the password empty, a temporary
+  one is generated and shown once.
+- **Work inside any company.** By default a platform admin sees only their own company, like everyone else.
+  **Open** on a company switches into it as an admin (a banner shows it, and **Back to my company** leaves).
+  This is deliberate and visible, not silent:
+  - Entering writes `platform_access_started` to **that company's** audit log, and every change made inside is
+    logged there with the platform admin's username and `via_platform_admin`, so its own admins can see it.
+  - The switch is a header (`X-Acting-Company`) the UI sends per browser tab. Anyone who is not a platform admin
+    sending it gets 403, and an unknown company gets 404. It is never ignored.
 
 The flag is set by an operator, never through the API or UI:
 
@@ -56,12 +65,14 @@ php artisan bms:platform-admin alice            # grant
 php artisan bms:platform-admin alice --revoke   # remove
 ```
 
-Creating a company also creates its first admin. If you leave the password empty, a temporary one is generated and
-shown once. Each creation is written to the creating admin's audit trail.
+**Treat platform-admin accounts as the most sensitive in the system.** One compromised account can read and change
+every company's data. Keep the number small, use strong unique passwords, and review `platform_access_started`
+entries.
 
 ## How tenant isolation works
 
-1. The session's company comes from the database on every request, never from the request body or token.
+1. The company comes from the database on every request, never from the request body or token. The only way to
+   change it is the platform admin switch above, which is checked and audited.
 2. Every tenant model (`BelongsToCompany`) carries a global scope that restricts it to that company and returns
    nothing if no company is set. It also refuses to save a row for a different company.
 3. Controllers and report queries also filter by company explicitly.
@@ -101,6 +112,33 @@ once. From then on:
   never a command line. See `agent/README.md` for set-up and what it does and does not prove.
 - Only admins can enroll agents and start backups. Technicians can still queue tests on their assigned servers.
 
+## External backup platforms (Acronis)
+
+Some servers are backed up by a platform that BMS does not run, such as Acronis Cyber Protect Cloud. An admin adds a
+**connection** under **Integrations** (datacenter URL plus an API client ID and secret), then links each server to its
+device from the server's page (**Link to platform device**, picked from the platform's own device list).
+
+- BMS **reads** each linked device's backup status every 15 minutes (and on **Sync now**). It never changes anything
+  on the platform. Create the API client in the Acronis console with a read-only role.
+- The latest run is turned into the server's backup status: **success**, **failed** (the latest run did not
+  succeed), or **warning** (no success within the connection's limit, 36 hours by default). A device with no backup
+  data is **unknown** and changes nothing. Only policies whose type mentions "backup" count, so antimalware or patch
+  runs are never mistaken for backups.
+- Each newly seen run is recorded as a backup (method `acronis`, "Reported by ...") so the dashboard and reports
+  count it. A sync sees the latest run only, so several runs between two syncs appear as one.
+- Admins are alerted once when a server turns failed or overdue, and once per outage if the platform cannot be read.
+- Secrets are encrypted with `APP_KEY` and never returned by the API. **Changing `APP_KEY` makes stored connections
+  unreadable**, and they have to be added again. BMS only calls `https://` hosts under `acronis.com`
+  (`BMS_INTEGRATION_HOST_SUFFIXES`), so it cannot be pointed at internal addresses.
+- This is the platform's word, not BMS's proof. Reports say so. For BMS-verified restore tests on such a server, add an
+  agent as well.
+- Written from Acronis's published API documentation. Check it against your own console with
+  `php artisan bms:acronis-probe <connection id>`, which prints the response structure (field names and types, never
+  device names or secrets).
+
+Other platforms (Veeam, Commvault, Microsoft 365, AWS, Azure) are not built. Each would be another adapter behind the
+same connection and link model.
+
 ## Reports
 
 Four reports under **Reports** (admins and managers): compliance, SLA performance, security and access, and DR
@@ -119,7 +157,7 @@ Print, then Save as PDF. Last month's compliance report and last quarter's SLA r
 ## Decisions where the blueprint conflicted or was silent
 
 - **User model:** v3.0 (single company per user) is followed. The `MULTI_COMPANY_*` documents are treated as
-  superseded. The platform-admin flag above is the one cross-company capability, and it only creates companies.
+  superseded. The platform-admin flag above is the one cross-company capability, added at the owner's request.
 - **API paths:** `/api/servers`, `/api/backup-jobs`, etc., scoped by session, per v3.0.
 - **Health score:** not defined in the blueprint. Half backup success rate, half test pass rate over 30 days. With no
   data it is empty, not 100.

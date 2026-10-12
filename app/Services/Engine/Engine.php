@@ -6,6 +6,7 @@ use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
 use App\Models\Company;
 use App\Services\Agents\AgentService;
+use App\Services\Integrations\IntegrationSync;
 use App\Services\Reports\ReportService;
 use App\Services\TestResults;
 use App\Support\CompanyContext;
@@ -163,15 +164,16 @@ final class Engine
         }
         try {
             $queued = self::scheduleDueTests();
-            $ran = $escalated = $expired = $backups = 0;
+            $ran = $escalated = $expired = $backups = $synced = 0;
             foreach (Company::where('is_active', true)->pluck('id') as $id) {
                 $ran += self::runDueTests($id);
                 $escalated += self::escalateFailures($id);
                 $expired += AgentService::expireStale($id);
                 $backups += AgentService::scheduleDueBackups($id);
+                $synced += IntegrationSync::runDue($id, config('bms.integration_sync_minutes'));
             }
 
-            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'expired' => $expired, 'backups' => $backups, 'reports' => ReportService::generateScheduled()];
+            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'expired' => $expired, 'backups' => $backups, 'synced' => $synced, 'reports' => ReportService::generateScheduled()];
         } finally {
             DB::select('SELECT RELEASE_LOCK(?)', [self::LOCK]);
         }

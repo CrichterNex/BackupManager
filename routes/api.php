@@ -4,6 +4,7 @@ use App\Http\Controllers\AgentController;
 use App\Http\Controllers\AuditController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\IntegrationController;
 use App\Http\Controllers\JobController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\PlatformCompanyController;
@@ -47,6 +48,18 @@ Route::middleware(['auth:sanctum', 'tenant', 'throttle:api'])->group(function ()
     Route::get('/servers/{id}/agent', [ServerAgentController::class, 'show'])->middleware('permission:servers:read')->whereNumber('id');
     Route::post('/servers/{id}/agent', [ServerAgentController::class, 'enroll'])->middleware('permission:servers:write')->whereNumber('id');
     Route::delete('/servers/{id}/agent', [ServerAgentController::class, 'destroy'])->middleware('permission:servers:write')->whereNumber('id');
+    // External backup platforms: connections are admin-only, a server's links follow server permissions.
+    Route::middleware('permission:integrations:manage')->prefix('integrations')->group(function () {
+        Route::get('/', [IntegrationController::class, 'index']);
+        Route::post('/', [IntegrationController::class, 'store']);
+        Route::delete('/{id}', [IntegrationController::class, 'destroy'])->whereNumber('id');
+        Route::post('/{id}/test', [IntegrationController::class, 'test'])->whereNumber('id');
+        Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->whereNumber('id');
+        Route::get('/{id}/devices', [IntegrationController::class, 'devices'])->whereNumber('id');
+    });
+    Route::get('/servers/{id}/links', [IntegrationController::class, 'links'])->middleware('permission:servers:read')->whereNumber('id');
+    Route::post('/servers/{id}/links', [IntegrationController::class, 'link'])->middleware('permission:servers:write')->whereNumber('id');
+    Route::delete('/servers/{id}/links/{linkId}', [IntegrationController::class, 'unlink'])->middleware('permission:servers:write')->whereNumber('id')->whereNumber('linkId');
     Route::get('/agent-commands', [ServerAgentController::class, 'commands'])->middleware('permission:jobs:read');
 
     Route::prefix('backup-jobs')->group(function () {
@@ -86,6 +99,7 @@ Route::middleware(['auth:sanctum', 'tenant', 'throttle:api'])->group(function ()
     Route::middleware('platform')->prefix('platform')->group(function () {
         Route::get('/companies', [PlatformCompanyController::class, 'index']);
         Route::post('/companies', [PlatformCompanyController::class, 'store']);
+        Route::post('/companies/{id}/enter', [PlatformCompanyController::class, 'enter'])->whereNumber('id');
     });
 
     // Inside the authenticated group on purpose: an unauthenticated caller gets 401 for any path and so
