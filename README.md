@@ -58,9 +58,23 @@ The audit trail is write-once: a database trigger rejects UPDATE and DELETE.
   through the API.
 - **Passwords:** minimum 12 characters.
 
+## Test engine (Phase 3, first slice)
+
+Runs inside the app process (set `ENGINE_ENABLED=false` to turn it off) and ticks every `ENGINE_INTERVAL_SECONDS` (60).
+
+- **Random file restore** for `rsync`, `windows_manual_copy` and `linux_manual_copy` servers that have a
+  `backup_location_path` the BMS host can read. It picks a random file, copies it to a staging folder, compares
+  SHA-256 of both, and removes the copy. Queued weekly per server (`RANDOM_RESTORE_EVERY_DAYS`) against the latest
+  successful job, or on demand via `POST /api/backup-jobs/:id/test`.
+- **Retries:** a failed test is retried quietly after `TEST_RETRY_DELAY_MINUTES` (60), up to `TEST_MAX_ATTEMPTS` (3). Only
+  the last failure creates a failure record and alerts admins, with a storage check added to the message.
+- **Escalation:** a high or critical failure unresolved after 4 hours, then 8 hours, notifies managers as well.
+- Anything the engine cannot run (other test types, vendor methods, no path) is recorded as **skipped** with the
+  reason. It is never counted as a pass.
+
 ## Not built yet
 
 - LDAP login (users can be created as `ldap`, but logging in returns a clear "not configured" error)
-- Backup method integrations, the automated test engine and scheduler, email/SMS/Slack delivery, reports and
+- Backup method integrations (Veeam, Commvault, Acronis, M365, AWS, Azure), the other seven test types, email/SMS/Slack delivery, reports and
   PDF export, document upload for failures (Phases 2 to 4)
 - Mobile app

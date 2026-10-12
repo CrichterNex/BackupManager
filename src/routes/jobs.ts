@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { kickEngine } from '../engine/engine.js';
 import { audit } from '../audit.js';
 import { require_, session } from '../auth.js';
 import { withCompany } from '../db.js';
@@ -145,7 +146,7 @@ jobsRouter.delete('/:id', require_('jobs:write'), async (req, res) => {
 jobsRouter.post('/:id/test', require_('tests:run'), async (req, res) => {
   const s = session(req);
   const id = idParam(req);
-  const { test_type } = z.object({ test_type: z.enum(TEST_TYPES).default('synthetic_file') }).parse(req.body ?? {});
+  const { test_type } = z.object({ test_type: z.enum(TEST_TYPES).default('random_restore') }).parse(req.body ?? {});
   const test = await withCompany(s.company_id, async (db) => {
     const params: unknown[] = [id, s.company_id];
     const scope = technicianScope(s, 'j.server_id', params);
@@ -160,5 +161,6 @@ jobsRouter.post('/:id/test', require_('tests:run'), async (req, res) => {
     await audit(db, req, { action: 'test_triggered', resource_type: 'test', resource_id: rows[0].id, details: { backup_job_id: id, test_type } });
     return rows[0];
   });
+  kickEngine();
   res.status(202).json({ success: true, data: test });
 });
