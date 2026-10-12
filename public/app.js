@@ -16,11 +16,12 @@ const PAGES = [
   { id: 'tests', title: 'Tests', render: tests },
   { id: 'reports', title: 'Reports', render: reports, noTechnician: true },
   { id: 'users', title: 'Users', render: users, admin: true },
+  { id: 'companies', title: 'Companies', render: companies, platform: true },
   { id: 'audit', title: 'Audit log', render: auditLog, admin: true },
   { id: 'profile', title: 'My profile', render: profile },
 ];
 
-const visible = (p) => (!p.admin || isAdmin()) && (!p.noTechnician || me.role !== 'company_technician');
+const visible = (p) => (!p.admin || isAdmin()) && (!p.noTechnician || me.role !== 'company_technician') && (!p.platform || me.platform);
 
 const root = document.getElementById('app');
 let unread = 0;
@@ -80,7 +81,7 @@ function loginScreen() {
     e.preventDefault(); btn.disabled = true; err.hidden = true;
     try {
       const r = await api('POST', '/auth/login', { username: user.value.trim(), password: pass.value });
-      me = { user: r.user, company: r.company, role: r.role };
+      me = { user: r.user, company: r.company, role: r.role, platform: r.platform_admin };
       show();
     } catch (ex) { err.hidden = false; err.textContent = ex.message; btn.disabled = false; pass.value = ''; pass.focus(); }
   } },
@@ -310,6 +311,44 @@ async function reportForm() {
   if (done) { toast('Report generated'); show(); }
 }
 
+// --- companies (platform admins only) ---
+async function companies() {
+  const r = await api('GET', '/platform/companies');
+  return h('div', {}, topbar('Companies', 'Every company on this system. You only see counts here, never another company’s records.', h('button', { class: 'primary', onclick: companyForm }, 'Create company')),
+    card(null, table([
+      { title: 'Company', render: (c) => c.name }, { title: 'Slug', render: (c) => c.slug }, { title: 'Plan', render: (c) => label(c.subscription_tier) },
+      { title: 'Users', render: (c) => c.users }, { title: 'Servers', render: (c) => `${c.servers}${c.max_servers ? ` / ${c.max_servers}` : ''}` },
+      { title: 'Status', render: (c) => badge(c.is_active ? 'success' : 'failed', c.is_active ? 'Active' : 'Disabled') }, { title: 'Created', render: (c) => fmtDate(c.created_at) },
+    ], r.data)));
+}
+async function companyForm() {
+  let created = null;
+  const done = await formModal({
+    title: 'Create company', submitLabel: 'Create',
+    fields: [
+      { name: 'name', label: 'Company name', required: true },
+      { name: 'slug', label: 'Slug', required: true, hint: 'Lowercase letters, digits and hyphens, e.g. acme-corp. Used in the web address.' },
+      { name: 'subscription_tier', label: 'Plan', type: 'select', options: opts(['basic', 'pro', 'enterprise']) },
+      { name: 'max_servers', label: 'Server limit', type: 'number', hint: 'Leave empty for no limit.' },
+      { name: 'admin_username', label: 'First admin username', required: true },
+      { name: 'admin_email', label: 'First admin email', type: 'email', required: true },
+      { name: 'admin_password', label: 'First admin password', type: 'password', hint: 'At least 12 characters. Leave empty to generate one.' },
+    ],
+    onSubmit: async (v) => {
+      created = await api('POST', '/platform/companies', {
+        name: v.name.trim(), slug: v.slug.trim(), subscription_tier: v.subscription_tier,
+        max_servers: v.max_servers ? Number(v.max_servers) : null,
+        admin_username: v.admin_username.trim(), admin_email: v.admin_email.trim(), admin_password: v.admin_password || null,
+      });
+    },
+  });
+  if (!done) return;
+  if (created.admin.temporary_password) {
+    await confirmModal(`${created.data.name} created`, `Give this temporary password to ${created.admin.username}. It is shown only once: ${created.admin.temporary_password}`, 'Done');
+  } else toast('Company created');
+  show();
+}
+
 // --- users (admin) ---
 async function users() {
   const r = await api('GET', '/users');
@@ -391,7 +430,7 @@ async function notifications() {
 (async () => {
   try {
     const r = (await api('GET', '/me')).data;
-    me = { user: { username: r.username, email: r.email }, company: { company_name: r.company_name, company_slug: r.company_slug }, role: r.role };
+    me = { user: { username: r.username, email: r.email }, company: { company_name: r.company_name, company_slug: r.company_slug }, role: r.role, platform: r.platform_admin };
     show();
   } catch { loginScreen(); }
 })();
