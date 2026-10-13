@@ -5,8 +5,10 @@ namespace App\Http\Controllers;
 use App\Models\Company;
 use App\Models\User;
 use App\Services\Audit;
+use App\Services\CompanyTests;
 use App\Support\ApiException;
 use App\Support\CompanyContext;
+use App\Support\Constants;
 use App\Support\Passwords;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -43,6 +45,39 @@ class PlatformCompanyController extends Controller
         }
 
         return response()->json(['success' => true, 'data' => ['id' => $company->id, 'name' => $company->name, 'slug' => $company->slug]]);
+    }
+
+    /** Which tests a company is offered, and whether the company has turned any off. */
+    public function testSettings(int $id)
+    {
+        $company = Company::find($id) ?? throw ApiException::notFound('Company', 'COMPANY_001');
+
+        return response()->json(['success' => true, 'data' => CompanyTests::listing($company->id)]);
+    }
+
+    /** Choose which tests a company is offered. Turning one off here also winds down anything waiting on it, and is recorded in the company's own audit trail. */
+    public function updateTestSettings(Request $request, int $id)
+    {
+        $company = Company::find($id) ?? throw ApiException::notFound('Company', 'COMPANY_001');
+        $b = $request->validate(['tests' => ['required', 'array', 'min:1'], 'tests.*' => ['boolean']]);
+        foreach (array_keys($b['tests']) as $type) {
+            if (! in_array($type, Constants::TEST_TYPES, true)) {
+                throw ApiException::badRequest("\"$type\" is not a test.");
+            }
+        }
+        $states = CompanyTests::states($company->id);
+        $changed = [];
+        foreach ($b['tests'] as $type => $on) {
+            if ($states[$type]['available'] !== (bool) $on) {
+                CompanyTests::set($company->id, $type, ['available' => (bool) $on], $request->user()->id);
+                $changed[$type] = (bool) $on;
+            }
+        }
+        if ($changed) {
+            CompanyContext::run($company->id, fn () => DB::transaction(fn () => Audit::log($request, 'test_availability_changed', 'company', $company->id, ['available' => $changed])));
+        }
+
+        return response()->json(['success' => true, 'data' => CompanyTests::listing($company->id)]);
     }
 
     public function store(Request $request)

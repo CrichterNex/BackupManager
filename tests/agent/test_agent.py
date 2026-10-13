@@ -3,9 +3,13 @@ import importlib.util
 import json
 import os
 import subprocess
+import stat
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 import xml.etree.ElementTree as ET
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -279,9 +283,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(set(only_backup["actions"]), {"backup"})
         self.assertNotIn("locations", only_backup)
 
-    def test_an_install_with_nothing_to_do_is_refused(self):
+    def test_an_install_with_nothing_to_do_is_refused_only_when_bms_cannot_supply_actions(self):
         with self.assertRaises(agent.InstallError):
-            agent.build_config("https://b", "t", {}, None)
+            agent.build_config("https://b", "t", {}, None, remote_actions=False)
+        cfg = agent.build_config("https://b", "t", {}, None)
+        self.assertTrue(cfg["remote_actions"])
+        agent.validate_config(json.loads(json.dumps(cfg)))
+
+    def test_remote_actions_are_on_by_default_and_can_be_left_out(self):
+        self.assertTrue(agent.build_config("https://b", "t", {"nas": "/mnt"}, None)["remote_actions"])
+        self.assertNotIn("remote_actions", agent.build_config("https://b", "t", {"nas": "/mnt"}, None, remote_actions=False))
 
     def test_the_systemd_unit_restarts_always_and_starts_at_boot(self):
         unit = agent.build_systemd_unit("/usr/bin/python3", "/opt/bms-agent/bms_agent.py", "/etc/bms-agent/config.json")
@@ -335,9 +346,10 @@ class InstallCommandTests(unittest.TestCase):
 
     def test_missing_pieces_and_plain_http_are_refused_with_a_reason(self):
         self.assertEqual(cli("--install", "--dry-run", "--location", "nas=/x")[0], 2, "no url or secret")
-        code, out = cli("--install", "--dry-run", "--url", "https://b", "--token", "t")
+        code, out = cli("--install", "--dry-run", "--url", "https://b", "--token", "t", "--no-remote-actions")
         self.assertEqual(code, 2)
         self.assertIn("at least one thing", out)
+        self.assertEqual(cli("--install", "--dry-run", "--url", "https://b", "--token", "t")[0], 0, "BMS can supply the actions")
         code, out = cli("--install", "--dry-run", "--url", "http://b", "--token", "t", "--location", "nas=/x")
         self.assertEqual(code, 2)
         self.assertIn("https://", out)
@@ -373,3 +385,630 @@ class InstallCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManagedActionTests(unittest.TestCase):
+    def setUp(self):
+        # These tests are about managed actions, so keep the machine's own built-in tools out of the way.
+        self._orig = agent.builtin_available
+        agent.builtin_available = lambda kind: False
+        self.addCleanup(lambda: setattr(agent, "builtin_available", self._orig))
+
+    def cfg(self, remote=True, **extra):
+        return agent.validate_config({"bms_url": "https://b", "token": "t", "remote_actions": remote, "actions": extra.get("actions", {}), "locations": {"n": "/x"}})
+
+    def test_managed_actions_are_ignored_unless_the_config_allows_them(self):
+        c = self.cfg(remote=False, actions={"restore-test": {"type": "restore_test"}})
+        c["_managed"] = agent.clean_managed({"backup": {"command": ["/b.sh"]}})
+        self.assertEqual(set(agent.effective_actions(c)), {"restore-test"})
+
+    def test_a_managed_command_is_added_and_advertised(self):
+        c = self.cfg()
+        c["_managed"] = agent.clean_managed({"backup": {"type": "command", "command": ["/b.sh", "--full"], "timeout_seconds": 600, "cwd": "/srv"}})
+        a = agent.effective_actions(c)["backup"]
+        self.assertEqual((a["command"], a["timeout_seconds"], a["cwd"]), (["/b.sh", "--full"], 600, "/srv"))
+        self.assertEqual(agent.advertised_actions(c), {"backup": {"type": "command", "timeout_seconds": 600}})
+
+    def test_an_unconfigured_default_never_hides_a_file_action_and_fails_clearly(self):
+        c = self.cfg(actions={"backup": {"type": "command", "command": ["/file.sh"]}})
+        c["_managed"] = agent.clean_managed({"backup": {"command": None}})
+        self.assertEqual(agent.effective_actions(c)["backup"]["command"], ["/file.sh"])
+        c2 = self.cfg()
+        c2["_managed"] = agent.clean_managed({"backup": {"command": None}})
+        status, _, out, _ = agent.run_command(agent.effective_actions(c2)["backup"])
+        self.assertEqual(status, "failed")
+        self.assertIn("no command yet", out)
+
+    def test_a_managed_command_replaces_a_file_command_but_never_a_restore_test(self):
+        c = self.cfg(actions={"backup": {"type": "command", "command": ["/old.sh"]}, "restore-test": {"type": "restore_test"}})
+        c["_managed"] = agent.clean_managed({"backup": {"command": ["/new.sh"]}, "restore-test": {"command": ["/evil.sh"]}})
+        e = agent.effective_actions(c)
+        self.assertEqual(e["backup"]["command"], ["/new.sh"])
+        self.assertEqual(e["restore-test"]["type"], "restore_test")
+
+    def test_malformed_managed_entries_are_dropped_not_fatal(self):
+        bad = {"ok": {"command": ["/b.sh"]}, "has space": {"command": ["/b.sh"]}, "str": {"command": "rm -rf /"},
+               "empty-arg": {"command": [""]}, "nums": {"command": [1]}, "t": {"command": ["/b"], "timeout_seconds": 5}, "list": ["x"]}
+        out = agent.clean_managed(bad)
+        self.assertEqual(set(out), {"ok", "t"})
+        self.assertNotIn("timeout_seconds", out["t"], "out of range timeouts fall back to the default")
+        self.assertEqual(agent.clean_managed("nope"), {})
+
+    def test_a_command_from_a_managed_action_runs_without_a_shell(self):
+        c = self.cfg()
+        c["_managed"] = agent.clean_managed({"backup": {"command": [sys.executable, "-c", "print('hi; echo no')"]}})
+        status, code, out, _ = agent.run_command(agent.effective_actions(c)["backup"])
+        self.assertEqual((status, code), ("success", 0))
+        self.assertIn("hi; echo no", out)
+
+
+def write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+class BuiltinBackupTests(unittest.TestCase):
+    def test_every_layout_puts_files_where_the_source_comparison_looks_for_them(self):
+        """backup_target and map_to_source must be exact opposites, or a verified backup would look like a mismatch."""
+        if os.name == "nt":
+            src, dest = r"C:\Data\Web", r"D:\Backups\web-01"
+            includes = [r"C:\Data\Web", r"C:\Data\Mail"]
+        else:
+            src, dest = "/data/web", "/mnt/b/web-01"
+            includes = ["/data/web", "/data/mail"]
+        for layout, inc in (("by_folder_name", includes), ("full_path", includes), ("contents", [src])):
+            target = agent.backup_target(layout, src, dest)
+            rel = os.path.relpath(os.path.join(target, "sub", "f.txt"), dest).split(os.sep)
+            back, why = agent.map_to_source(rel, layout, inc)
+            self.assertIsNone(why, layout)
+            self.assertEqual(os.path.normcase(back), os.path.normcase(os.path.join(src, "sub", "f.txt")), layout)
+
+    def test_a_drive_root_and_an_unknown_layout_are_refused(self):
+        with self.assertRaises(ValueError):
+            agent.build_backup_command("robocopy", "C:\\", "D:\b", [])
+        with self.assertRaises(ValueError):
+            agent.backup_target("nonsense", "/a", "/b")
+
+    def test_the_robocopy_command_copies_only_and_excludes_what_is_inside_the_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "Folder")
+            os.makedirs(os.path.join(src, "Sub1"))
+            cmd = agent.build_backup_command("robocopy", src, os.path.join(d, "out"), [os.path.join(src, "Sub1"), os.path.join(src, "x.tmp"), os.path.join(d, "Elsewhere")])
+        self.assertEqual(cmd[:3], ["robocopy", src, os.path.join(d, "out")])
+        for flag in ("/MIR", "/PURGE"):
+            self.assertNotIn(flag, cmd, "must never delete at the destination")
+        self.assertEqual(cmd[cmd.index("/XD") + 1], os.path.join(src, "Sub1"))
+        self.assertEqual(cmd[cmd.index("/XF") + 1], os.path.join(src, "x.tmp"))
+        self.assertNotIn(os.path.join(d, "Elsewhere"), cmd)
+
+    def test_the_rsync_command_never_deletes_and_anchors_and_escapes_exclusions(self):
+        cmd = agent.build_backup_command("rsync", "/data/web", "/mnt/b/web", ["/data/web/cache", "/data/web/we[ir]d*", "/data/mail"])
+        self.assertNotIn("--delete", cmd)
+        self.assertIn("--exclude=/cache", cmd)
+        self.assertIn(r"--exclude=/we\[ir]d\*", cmd)
+        self.assertFalse(any("mail" in c for c in cmd), "exclusions outside the folder are left out")
+        self.assertEqual(cmd[-3:], ["--", "/data/web/", "/mnt/b/web/"])
+        self.assertEqual(" ".join(cmd).count("--"), len([c for c in cmd if c.startswith("--")]))
+
+    def test_exit_codes_mean_what_each_tool_says(self):
+        self.assertTrue(all(agent.backup_ok("robocopy", c) for c in range(0, 8)))
+        self.assertFalse(agent.backup_ok("robocopy", 8))
+        self.assertTrue(agent.backup_ok("rsync", 0) and agent.backup_ok("rsync", 24))
+        self.assertFalse(agent.backup_ok("rsync", 23))
+
+    def cfg(self, **kw):
+        c = {"bms_url": "https://b", "token": "t", "actions": {}, "remote_actions": True, "locations": {}, "source_roots": []}
+        c.update(kw)
+        return agent.validate_config(c)
+
+    @unittest.skipUnless(os.name == "nt" and agent.builtin_available("robocopy"), "needs robocopy on Windows")
+    def test_robocopy_really_copies_honours_exclusions_and_deletes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, loc = os.path.join(d, "Folder"), os.path.join(d, "loc")
+            for sub in ("Sub1", "Sub2"):
+                os.makedirs(os.path.join(src, sub))
+                write(os.path.join(src, sub, "f.txt"), sub)
+            write(os.path.join(src, "top.txt"), "top")
+            os.makedirs(os.path.join(loc, "web-01", "Folder"))
+            write(os.path.join(loc, "web-01", "Folder", "old-extra.txt"), "already in the backup")
+            c = self.cfg(locations={"nas": loc}, source_roots=[d])
+            cmd = {"location": "nas", "subpath": "web-01", "source": {"layout": "by_folder_name", "folders": [src], "excluded": [os.path.join(src, "Sub1")]}}
+            status, _, out, _ = agent.run_builtin_backup(c, "robocopy", cmd)
+            self.assertEqual(status, "success", out)
+            dest = os.path.join(loc, "web-01", "Folder")
+            self.assertTrue(os.path.exists(os.path.join(dest, "top.txt")))
+            self.assertTrue(os.path.exists(os.path.join(dest, "Sub2", "f.txt")))
+            self.assertFalse(os.path.exists(os.path.join(dest, "Sub1")), "excluded folder must not be copied")
+            self.assertTrue(os.path.exists(os.path.join(dest, "old-extra.txt")), "copy only: nothing is deleted at the destination")
+
+    def test_a_folder_outside_source_roots_a_missing_folder_and_an_unknown_location_are_refused(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            real = agent.builtin_available
+            agent.builtin_available = lambda kind: True
+            try:
+                src = os.path.join(d, "a")
+                os.makedirs(src)
+                c = self.cfg(locations={"nas": os.path.join(d, "loc")}, source_roots=[d])
+                job = lambda f, loc="nas": {"location": loc, "subpath": "x", "source": {"layout": "by_folder_name", "folders": [f], "excluded": []}}
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", job(os.path.join(other, "z")))
+                self.assertEqual(st, "failed")
+                self.assertIn("source_roots", out)
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", job(os.path.join(d, "missing")))
+                self.assertIn("does not exist", out)
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", job(src, "nope"))
+                self.assertIn("no path for the location", out)
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", {"location": "nas", "subpath": "../escape", "source": {"layout": "contents", "folders": [src], "excluded": []}})
+                self.assertIn("invalid destination", out)
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", {"location": "nas", "source": {}})
+                self.assertIn("did not send the folders", out)
+            finally:
+                agent.builtin_available = real
+
+    def test_the_built_in_tools_are_advertised_only_where_they_exist(self):
+        real = agent.builtin_available
+        try:
+            agent.builtin_available = lambda kind: kind == "rsync"
+            self.assertEqual(agent.advertised_actions(self.cfg()), {"rsync": {"type": "rsync", "timeout_seconds": 8 * 3600}})
+        finally:
+            agent.builtin_available = real
+
+
+class ManagedLocationTests(unittest.TestCase):
+    def cfg(self, remote=True, locations=None):
+        return agent.validate_config({"bms_url": "https://b", "token": "t", "remote_actions": remote, "actions": {} if remote else {"b": {"type": "command", "command": ["x"]}}, "locations": locations or {}})
+
+    def test_a_location_set_in_bms_is_used_and_advertised_only_when_remote_actions_are_on(self):
+        on, off = self.cfg(), self.cfg(remote=False, locations={"a": "/x"})
+        for c in (on, off):
+            c["_managed_locations"] = agent.clean_managed_locations({"cnt": os.path.abspath(os.sep + "mnt")})
+        self.assertIn("cnt", agent.effective_locations(on))
+        self.assertNotIn("cnt", agent.effective_locations(off))
+        path, why = agent.restore_path(on, {}, "cnt", None)
+        self.assertEqual((path, why), (os.path.abspath(os.sep + "mnt"), None))
+
+    def test_the_config_file_wins_over_bms_for_the_same_key(self):
+        c = self.cfg(locations={"cnt": "/from-file"})
+        c["_managed_locations"] = {"cnt": "/from-bms", "other": "/o"}
+        self.assertEqual(agent.effective_locations(c), {"cnt": "/from-file", "other": "/o"})
+
+    def test_malformed_managed_locations_are_dropped(self):
+        b = chr(92)
+        out = agent.clean_managed_locations({"ok": os.path.abspath(os.sep + "m"), "Bad Key": "/x", "rel": "rel/x", "unc": b * 2 + "nas" + b + "s", "nul": "/x" + chr(0), "n": 5})
+        self.assertEqual(set(out), {"ok", "unc"} if os.name == "nt" else {"ok", "unc"})
+        self.assertEqual(agent.clean_managed_locations("nope"), {})
+
+
+class ManagedRootTests(unittest.TestCase):
+    def cfg(self, remote=True, roots=None):
+        return agent.validate_config({"bms_url": "https://b", "token": "t", "remote_actions": remote, "source_roots": roots or [],
+                                      "actions": {} if remote else {"b": {"type": "command", "command": ["x"]}}})
+
+    def test_roots_from_bms_are_added_to_the_files_only_when_remote_actions_are_on(self):
+        here = os.path.abspath(os.sep + "srv")
+        on, off = self.cfg(roots=[os.path.abspath(os.sep + "file")]), self.cfg(remote=False)
+        for c in (on, off):
+            c["_managed_roots"] = agent.clean_managed_roots([here, here])
+        self.assertEqual(agent.effective_source_roots(on), [os.path.abspath(os.sep + "file"), here])
+        self.assertEqual(agent.effective_source_roots(off), [])
+
+    def test_malformed_roots_are_dropped(self):
+        ok = os.path.abspath(os.sep + "ok")
+        self.assertEqual(agent.clean_managed_roots([ok, "rel/x", ok + "/../etc", 5, "", ok]), [ok])
+        self.assertEqual(agent.clean_managed_roots("nope"), [])
+
+    def test_a_folder_allowed_in_bms_lets_a_backup_read_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "a")
+            os.makedirs(src)
+            c = self.cfg()
+            real = agent.builtin_available
+            agent.builtin_available = lambda kind: True
+            try:
+                cmd = {"location": "x", "subpath": "y", "source": {"layout": "contents", "folders": [src], "excluded": []}}
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", cmd)
+                self.assertIn("source_roots", out)
+                c["_managed_roots"] = [d]
+                st, _, out, _ = agent.run_builtin_backup(c, "rsync", cmd)
+                self.assertNotIn("source_roots", out, "now past the folder check (it stops later, on the unknown location)")
+                self.assertIn("no path for the location", out)
+            finally:
+                agent.builtin_available = real
+
+
+class LocationFolderTests(unittest.TestCase):
+    def cfg(self, loc, roots):
+        return agent.validate_config({"bms_url": "https://b", "token": "t", "remote_actions": True, "actions": {}, "locations": {"nas": loc}, "source_roots": roots})
+
+    def run_backup(self, c, src):
+        real = agent.builtin_available
+        agent.builtin_available = lambda kind: True
+        try:
+            return agent.run_builtin_backup(c, "rsync", {"location": "nas", "subpath": "web-01/daily", "source": {"layout": "contents", "folders": [src], "excluded": []}})
+        finally:
+            agent.builtin_available = real
+
+    def test_a_missing_location_folder_is_reported_not_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, missing = os.path.join(d, "src"), os.path.join(d, "share", "TestBkp")
+            os.makedirs(src)
+            status, _, out, _ = self.run_backup(self.cfg(missing, [d]), src)
+            self.assertEqual(status, "failed")
+            self.assertIn("does not exist", out)
+            self.assertIn(missing, out)
+            self.assertFalse(os.path.exists(os.path.join(d, "share")), "the agent must not invent a location's folder")
+
+    def test_access_denied_on_a_share_explains_the_service_account(self):
+        real = os.stat
+        unc = chr(92) * 2 + "vault" + chr(92) + "IT" + chr(92) + "TestBkp"
+        def deny(path, *a, **k):
+            if str(path) == unc:
+                raise PermissionError(5, "Access is denied")
+            return real(path, *a, **k)
+        os.stat = deny
+        try:
+            msg = agent.folder_problem(unc, "the backup location folder")
+        finally:
+            os.stat = real
+        self.assertIn("Access denied", msg)
+        if os.name == "nt":
+            self.assertIn("COMPUTERNAME$", msg)
+            self.assertIn(agent.run_as(), msg)
+
+    def test_a_file_where_a_folder_should_be_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "afile")
+            write(f, "x")
+            self.assertIn("is not a folder", agent.folder_problem(f, "the location"))
+            self.assertIsNone(agent.folder_problem(d, "the location"))
+
+    def test_the_jobs_own_folders_are_created_below_an_existing_location(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, loc = os.path.join(d, "src"), os.path.join(d, "loc")
+            os.makedirs(src)
+            os.makedirs(loc)
+            real_run = agent.subprocess.run
+            agent.subprocess.run = lambda *a, **k: type("P", (), {"returncode": 0, "stdout": b"ok"})()
+            try:
+                status, _, out, _ = self.run_backup(self.cfg(loc, [d]), src)
+            finally:
+                agent.subprocess.run = real_run
+            self.assertEqual(status, "success", out)
+            self.assertTrue(os.path.isdir(os.path.join(loc, "web-01", "daily")))
+
+
+class CredentialTests(unittest.TestCase):
+    UNC = chr(92) * 2 + "vault" + chr(92) + "IT" + chr(92) + "TestBkp"
+
+    def cfg(self, remote=True):
+        c = agent.validate_config({"bms_url": "https://b", "token": "t", "remote_actions": remote, "locations": {"vault": self.UNC},
+                                   "actions": {} if remote else {"b": {"type": "command", "command": ["x"]}}})
+        c["_credentials"] = agent.clean_managed_credentials({"vault": {"username": "CORP" + chr(92) + "svc", "password": "S3cret!"}})
+        return c
+
+    def patch(self, rc_sequence):
+        calls = []
+        real_nt, real_conn = agent.os.name, agent._wnet_connect
+        agent.os.name = "nt"
+
+        def fake(share, user, pw):
+            calls.append((share, user, pw))
+            return rc_sequence.pop(0) if rc_sequence else 0
+        agent._wnet_connect = fake
+
+        def undo():
+            agent.os.name, agent._wnet_connect = real_nt, real_conn
+        self.addCleanup(undo)
+        return calls
+
+    def test_it_signs_in_to_the_share_root_with_the_stored_account(self):
+        calls = self.patch([0])
+        self.assertIsNone(agent.ensure_location_access(self.cfg(), "vault"))
+        self.assertEqual(calls, [(chr(92) * 2 + "vault" + chr(92) + "IT", "CORP" + chr(92) + "svc", "S3cret!")])
+
+    def test_a_failed_sign_in_says_why_and_never_contains_the_password(self):
+        self.patch([1326])
+        msg = agent.ensure_location_access(self.cfg(), "vault")
+        self.assertIn("Could not sign in", msg)
+        self.assertIn("svc", msg)
+        self.assertIn("1326", msg)
+        self.assertNotIn("S3cret", msg)
+
+    def test_an_existing_connection_counts_as_success(self):
+        self.patch([85])
+        self.assertIsNone(agent.ensure_location_access(self.cfg(), "vault"))
+
+    def test_nothing_is_done_without_credentials_for_that_location_off_windows_or_with_remote_actions_off(self):
+        calls = self.patch([0])
+        c = self.cfg()
+        self.assertIsNone(agent.ensure_location_access(c, "other"))
+        self.assertIsNone(agent.ensure_location_access(self.cfg(remote=False), "vault"))
+        agent.os.name = "posix"
+        self.assertIsNone(agent.ensure_location_access(c, "vault"))
+        self.assertEqual(calls, [])
+
+    def test_a_local_folder_needs_no_sign_in(self):
+        calls = self.patch([0])
+        c = self.cfg()
+        c["locations"]["vault"] = "D:" + chr(92) + "Backups"
+        self.assertIsNone(agent.ensure_location_access(c, "vault"))
+        self.assertEqual(calls, [])
+
+    def test_credentials_are_checked_and_malformed_ones_dropped(self):
+        out = agent.clean_managed_credentials({"ok": {"username": "u", "password": "p"}, "Bad Key": {"username": "u", "password": "p"},
+                                               "nopw": {"username": "u"}, "empty": {"username": "", "password": "p"}, "str": "x"})
+        self.assertEqual(set(out), {"ok"})
+        self.assertEqual(agent.clean_managed_credentials(None), {})
+
+    def test_the_poll_reports_its_version_and_keeps_new_credentials_only_in_memory(self):
+        c = self.cfg()
+        c.pop("_credentials")
+        sent = []
+        real = agent.api
+
+        def fake(cfg, path, body):
+            sent.append(body)
+            return {"command": None, "managed_credentials": {"vault": {"username": "u", "password": "pw"}}, "credentials_version": 7}
+        agent.api = fake
+        try:
+            agent.poll(c)
+            agent.poll(c)
+        finally:
+            agent.api = real
+        self.assertEqual([b["credentials_version"] for b in sent], [0, 7])
+        self.assertEqual(c["_credentials"]["vault"]["password"], "pw")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(os.listdir(d), [], "nothing is written to disk")
+
+
+class LongRunningTests(unittest.TestCase):
+    def cfg(self, **actions):
+        return agent.validate_config({"bms_url": "https://b", "token": "t", "actions": actions or {"b": {"type": "command", "command": ["x"]}}})
+
+    def test_every_action_tells_bms_how_long_it_may_run(self):
+        c = self.cfg(slow={"type": "command", "command": ["x"], "timeout_seconds": 86400}, quick={"type": "command", "command": ["y"]}, rt={"type": "restore_test", "path": "/x"})
+        a = agent.advertised_actions(c)
+        self.assertEqual(a["slow"]["timeout_seconds"], 86400)
+        self.assertEqual(a["quick"]["timeout_seconds"], agent.DEFAULT_TIMEOUT)
+        self.assertEqual(a["rt"]["timeout_seconds"], 300)
+
+    def patch_report(self, outcomes):
+        """Make report() raise or succeed in turn, and never really wait."""
+        calls = []
+        real_report, real_wait = agent.report, agent.stop.wait
+
+        def fake(cfg, cid, status, **kw):
+            calls.append((cid, status))
+            o = outcomes.pop(0) if outcomes else None
+            if isinstance(o, Exception):
+                raise o
+        agent.report = fake
+        agent.stop.wait = lambda delay: False
+        self.addCleanup(lambda: (setattr(agent, "report", real_report), setattr(agent.stop, "wait", real_wait)))
+        return calls
+
+    def test_a_result_is_retried_until_bms_accepts_it(self):
+        calls = self.patch_report([agent.ApiError(503, "down"), urllib.error.URLError("no route"), ConnectionResetError("x"), None])
+        self.assertTrue(agent.report_with_retry({}, 7, "success"))
+        self.assertEqual(len(calls), 4)
+
+    def test_a_refusal_is_final_and_not_retried(self):
+        calls = self.patch_report([agent.ApiError(409, "This command is already expired.")])
+        self.assertFalse(agent.report_with_retry({}, 7, "success"))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_busy_or_slow_bms_is_retried_but_a_bad_request_is_not(self):
+        calls = self.patch_report([agent.ApiError(429, "slow down"), agent.ApiError(408, "timeout"), None])
+        self.assertTrue(agent.report_with_retry({}, 7, "success"))
+        self.assertEqual(len(calls), 3)
+        calls = self.patch_report([agent.ApiError(400, "bad")])
+        self.assertFalse(agent.report_with_retry({}, 8, "success"))
+        self.assertEqual(len(calls), 1)
+
+    def test_it_gives_up_after_the_last_try_and_when_asked_to_stop(self):
+        calls = self.patch_report([agent.ApiError(500, "x")] * 50)
+        self.assertFalse(agent.report_with_retry({}, 7, "success"))
+        self.assertEqual(len(calls), 1 + len(agent.REPORT_RETRY_DELAYS))
+        self.assertGreaterEqual(sum(agent.REPORT_RETRY_DELAYS), 20 * 60, "keeps trying for a long while")
+        self.assertLessEqual(sum(agent.REPORT_RETRY_DELAYS), 29 * 60, "but inside the time BMS waits")
+        calls = self.patch_report([agent.ApiError(500, "x")] * 50)
+        agent.stop.wait = lambda delay: True
+        self.assertFalse(agent.report_with_retry({}, 7, "success"))
+        self.assertEqual(len(calls), 1, "stopping the service ends the retrying")
+
+    def test_execute_delivers_its_result_through_the_retrying_path(self):
+        calls = self.patch_report([agent.ApiError(502, "bad gateway"), None])
+        c = self.cfg(b={"type": "command", "command": [sys.executable, "-c", "print('ok')"]})
+        agent.execute(c, {"id": 5, "type": "backup", "action": "b"})
+        self.assertEqual(calls, [(5, "success"), (5, "success")])
+
+
+class MoreTestsTests(unittest.TestCase):
+    def action(self, **kw):
+        return dict({"type": "restore_test"}, **kw)
+
+    def test_the_agent_says_which_tests_it_can_run_and_how_long_each_may_take(self):
+        c = agent.validate_config({"bms_url": "https://b", "token": "t", "actions": {"restore-test": {"type": "restore_test", "full_read_timeout_seconds": 7200}}, "locations": {"n": "/x"}})
+        a = agent.advertised_actions(c)["restore-test"]
+        self.assertEqual(set(a["tests"]), {"random_restore", "synthetic_file", "full_recovery", "file_permissions"})
+        self.assertEqual(a["test_timeouts"]["full_recovery"], 7200)
+        self.assertEqual(a["test_timeouts"]["random_restore"], 300)
+
+    def test_write_and_read_back_passes_reports_free_space_and_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            status, code, out, details = agent.run_synthetic_file(self.action(), d)
+            self.assertEqual(status, "success", out)
+            self.assertEqual(details["hash_original"], details["hash_restored"])
+            self.assertIn("256.0 KB", details["summary"])
+            self.assertIn("free_bytes", details)
+            self.assertEqual(os.listdir(d), [], "the hidden test folder is removed")
+
+    def test_write_and_read_back_fails_when_the_location_cannot_be_written_or_is_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            status, _, out, details = agent.run_synthetic_file(self.action(), os.path.join(d, "nope"))
+            self.assertEqual((status, details["failure_type"]), ("failed", "file_missing"))
+            real = os.mkdir
+
+            def deny(path, *a, **k):
+                raise PermissionError(13, "Access is denied", path)
+            os.mkdir = deny
+            try:
+                status, _, out, details = agent.run_synthetic_file(self.action(), d)
+            finally:
+                os.mkdir = real
+            self.assertEqual((status, details["failure_type"]), ("failed", "access_denied"))
+            self.assertIn("write access", out)
+
+    def test_write_and_read_back_detects_data_that_does_not_come_back_the_same(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = open
+
+            def corrupt(path, mode="r", *a, **k):
+                f = real(path, mode, *a, **k)
+                if "rb" in mode and os.path.basename(str(path)) == "check.bin":
+                    f.close()
+                    import io
+                    return io.BytesIO(b"x" * agent.SYNTHETIC_BYTES)
+                return f
+            import builtins
+            builtins.open = corrupt
+            try:
+                status, _, out, details = agent.run_synthetic_file(self.action(), d)
+            finally:
+                builtins.open = real
+            self.assertEqual((status, details["failure_type"], details["severity"]), ("failed", "hash_mismatch", "critical"))
+
+    def test_full_read_reads_every_file_and_ignores_the_hidden_check_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            for rel, text in (("a.txt", "aaa"), ("sub/b.txt", "bbbbb"), ("sub/deep/c.txt", "c")):
+                os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+                write(os.path.join(d, rel), text)
+            os.makedirs(os.path.join(d, agent.CHECK_PREFIX + "1-ab"))
+            write(os.path.join(d, agent.CHECK_PREFIX + "1-ab", "check.bin"), "should not be counted")
+            status, _, out, details = agent.run_full_read(self.action(), d)
+            self.assertEqual(status, "success", out)
+            self.assertEqual((details["files"], details["bytes"]), (3, 9))
+            self.assertIn("3 files", details["summary"])
+
+    def test_full_read_fails_on_an_unreadable_file_an_empty_backup_a_missing_folder_and_a_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(os.path.join(d, "ok.txt"), "fine")
+            write(os.path.join(d, "bad.txt"), "broken")
+            real = open
+            import builtins
+
+            def flaky(path, mode="r", *a, **k):
+                if os.path.basename(str(path)) == "bad.txt":
+                    raise OSError(5, "Input/output error", str(path))
+                return real(path, mode, *a, **k)
+            builtins.open = flaky
+            try:
+                status, _, out, details = agent.run_full_read(self.action(), d)
+            finally:
+                builtins.open = real
+            self.assertEqual((status, details["failure_type"]), ("failed", "corruption"))
+            self.assertIn("bad.txt", out)
+            self.assertEqual(details["files"], 1)
+            status, _, _, details = agent.run_full_read(self.action(full_read_timeout_seconds=-1), d)
+            self.assertEqual(details["failure_type"], "timeout")
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(agent.run_full_read(self.action(), empty)[3]["failure_type"], "file_missing")
+            self.assertEqual(agent.run_full_read(self.action(), os.path.join(empty, "nope"))[3]["failure_type"], "file_missing")
+
+    def layout(self, d):
+        src, backup = os.path.join(d, "src"), os.path.join(d, "backup")
+        os.makedirs(src)
+        os.makedirs(backup)
+        for n in ("a.txt", "b.txt", "c.txt"):
+            write(os.path.join(src, n), n)
+            shutil.copy2(os.path.join(src, n), os.path.join(backup, n))
+        return src, backup, {"layout": "contents", "folders": [src], "excluded": []}
+
+    def test_permissions_match_when_a_backup_keeps_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, backup, source = self.layout(d)
+            status, _, out, details = agent.run_permission_check(self.action(), backup, source, [d])
+            self.assertEqual(status, "success", out)
+            self.assertNotIn("skip_reason", details)
+            self.assertIn("Permissions match on 3", details["summary"])
+
+    def test_permissions_that_differ_are_reported_with_both_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, backup, source = self.layout(d)
+            names = ("a.txt", "b.txt", "c.txt")
+            try:
+                for n in names:
+                    os.chmod(os.path.join(src, n), stat.S_IREAD)
+                    if os.name != "nt":
+                        os.chmod(os.path.join(backup, n), 0o666)
+                status, _, out, details = agent.run_permission_check(self.action(), backup, source, [d])
+            finally:
+                for n in names:
+                    os.chmod(os.path.join(src, n), stat.S_IWRITE | stat.S_IREAD)
+            self.assertEqual((status, details["failure_type"], details["severity"]), ("failed", "restore_failed", "medium"))
+            self.assertIn("Permissions differ on 3 of 3", out)
+            self.assertIn("source has", out)
+
+    def test_permissions_check_is_skipped_not_passed_when_it_cannot_compare(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, backup, source = self.layout(d)
+            for args, why in (((backup, None, [d]), "laid out"), ((backup, source, []), "source roots"), ((backup, source, [os.path.join(d, "elsewhere")]), "No sampled backup file")):
+                status, code, out, details = agent.run_permission_check(self.action(), *args)
+                self.assertEqual((status, code), ("success", 0))
+                self.assertIn(why, details["skip_reason"])
+                self.assertNotIn("summary", details, "a skip carries no pass summary")
+
+    def test_an_unknown_test_type_is_refused_not_run_as_a_random_restore(self):
+        sent = []
+        real = agent.report
+        agent.report = lambda cfg, cid, status, **kw: sent.append((status, kw))
+        try:
+            c = agent.validate_config({"bms_url": "https://b", "token": "t", "actions": {"restore-test": {"type": "restore_test", "path": "/x"}}})
+            agent.execute(c, {"id": 3, "type": "restore_test", "test_type": "database_integrity", "action": "restore-test", "location": None})
+        finally:
+            agent.report = real
+        self.assertEqual(sent[0][0], "failed")
+        self.assertIn("cannot run the database_integrity test", sent[0][1]["output"])
+
+    def test_the_hidden_check_folder_is_never_picked_as_a_random_restore_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(os.path.join(d, "real.txt"), "x")
+            os.makedirs(os.path.join(d, agent.CHECK_PREFIX + "9-zz"))
+            write(os.path.join(d, agent.CHECK_PREFIX + "9-zz", "check.bin"), "y")
+            picks = {os.path.basename(agent.pick_random_file(d, time.monotonic() + 10)) for _ in range(30)}
+            self.assertEqual(picks, {"real.txt"})
+
+
+class DispatchTests(unittest.TestCase):
+    def run_cmd(self, test_type, d, **extra):
+        sent = []
+        real = agent.report
+        agent.report = lambda cfg, cid, status, **kw: sent.append((cid, status, kw))
+        try:
+            c = agent.validate_config({"bms_url": "https://b", "token": "t", "locations": {"n": d}, "source_roots": [d],
+                                       "actions": {"restore-test": {"type": "restore_test"}}})
+            agent.execute(c, dict({"id": 9, "type": "restore_test", "test_type": test_type, "action": "restore-test", "location": "n", "subpath": None, "source": None}, **extra))
+        finally:
+            agent.report = real
+        return sent
+
+    def test_a_command_reaches_the_right_test_and_its_summary_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(os.path.join(d, "a.txt"), "hello")
+            full = self.run_cmd("full_recovery", d)
+            self.assertEqual((full[0][0], full[0][1]), (9, "success"))
+            self.assertIn("1 files", full[0][2]["details"]["summary"])
+            write_test = self.run_cmd("synthetic_file", d)
+            self.assertEqual(write_test[0][1], "success")
+            self.assertIn("Wrote and read back", write_test[0][2]["details"]["summary"])
+            self.assertEqual([n for n in os.listdir(d)], ["a.txt"], "the write test left nothing behind")
+            rand = self.run_cmd("random_restore", d)
+            self.assertEqual(rand[0][1], "success")
+            self.assertEqual(self.run_cmd(None, d)[0][1], "success", "a command from an older BMS, with no test type, is a random restore")
+
+    def test_a_permissions_command_with_no_layout_reports_a_skip_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(os.path.join(d, "a.txt"), "hello")
+            sent = self.run_cmd("file_permissions", d)
+            self.assertEqual(sent[0][1], "success")
+            self.assertIn("laid out", sent[0][2]["details"]["skip_reason"])
+            self.assertNotIn("summary", sent[0][2]["details"])

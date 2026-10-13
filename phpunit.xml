@@ -33,6 +33,8 @@
         <env name="QUEUE_CONNECTION" value="sync"/>
         <env name="SESSION_DRIVER" value="array"/>
         <env name="BMS_ENGINE_ENABLED" value="false"/>
+        <env name="BMS_MFA_REQUIRED" value="false"/>
+        <env name="BMS_MANUAL_VERIFY_PERCENT" value="0"/>
         <env name="PULSE_ENABLED" value="false"/>
         <env name="TELESCOPE_ENABLED" value="false"/>
         <env name="NIGHTWATCH_ENABLED" value="false"/>

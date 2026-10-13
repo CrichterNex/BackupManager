@@ -3,7 +3,8 @@
 return [
     // Sessions last 8 hours, matching the API spec's auth_token cookie.
     'session_hours' => 8,
-    'rate_limit_per_hour' => (int) env('BMS_RATE_LIMIT_PER_HOUR', 1000),
+    'rate_limit_per_hour' => (int) env('BMS_RATE_LIMIT_PER_HOUR', 1000), // changes (anything that is not a read)
+    'read_rate_limit_per_hour' => (int) env('BMS_READ_RATE_LIMIT_PER_HOUR', 7200), // reads, which live pages make every 15 seconds
     'login_attempts_per_15_min' => (int) env('BMS_LOGIN_ATTEMPTS_PER_15_MIN', 10),
 
     // Test engine: polled every minute by the scheduler. Retry and escalation timings follow the blueprint.
@@ -12,6 +13,10 @@ return [
     'test_max_attempts' => (int) env('BMS_TEST_MAX_ATTEMPTS', 3),
     // How long a passing test counts as current. After this a server shows "test overdue" until it is tested again.
     'test_fresh_days' => (int) env('BMS_TEST_FRESH_DAYS', 14),
+    'recovery_point_max_age_hours' => (int) env('BMS_RECOVERY_POINT_MAX_AGE_HOURS', 36), // a job with no schedule must have a successful backup newer than this
+    'manual_verify_percent' => (int) env('BMS_MANUAL_VERIFY_PERCENT', 20),        // share of passed manual tests a second person is asked to confirm
+    'manual_pick_window_days' => (int) env('BMS_MANUAL_PICK_WINDOW_DAYS', 14),     // how far back the item to open may be received
+    'manual_pick_max_position' => (int) env('BMS_MANUAL_PICK_MAX_POSITION', 10),   // the highest "nth email that day" it may ask for
     'random_restore_every_days' => (int) env('BMS_RANDOM_RESTORE_EVERY_DAYS', 7),
     'restore_staging_dir' => env('BMS_RESTORE_STAGING_DIR') ?: '',
 
@@ -24,6 +29,9 @@ return [
     'integration_sync_minutes' => (int) env('BMS_INTEGRATION_SYNC_MINUTES', 15),
 
     'agent_rate_limit_per_hour' => (int) env('BMS_AGENT_RATE_LIMIT_PER_HOUR', 1200),
+
+    // Two-step sign-in with an authenticator app. When true every user must set it up, and can do nothing else until they do.
+    'mfa_required' => (bool) env('BMS_MFA_REQUIRED', true),
 
     'min_password_length' => 12,
 ];

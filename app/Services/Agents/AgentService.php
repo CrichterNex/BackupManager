@@ -5,12 +5,14 @@ namespace App\Services\Agents;
 use App\Models\Agent;
 use App\Models\AgentCommand;
 use App\Models\BackupJob;
+use App\Models\BackupLocation;
 use App\Models\BackupTestExecution;
 use App\Models\Company;
 use App\Models\Server;
 use App\Services\Audit;
 use App\Services\TestResults;
 use App\Support\ApiException;
+use App\Support\BackupPaths;
 use App\Support\CompanyContext;
 use Carbon\CarbonImmutable;
 use Cron\CronExpression;
@@ -28,6 +30,12 @@ final class AgentService
     private const BACKUP_DEADLINE_HOURS = 8;
 
     private const TEST_DEADLINE_HOURS = 2;
+
+    /** Extra time on top of an action's own limit, for the agent to finish, deliver its result and retry if BMS is briefly unreachable. */
+    private const RUN_MARGIN_MINUTES = 30;
+
+    /** A command that started less than this long ago is never treated as lost, so a check-in that crosses its start cannot fail it. */
+    private const ORPHAN_GRACE_SECONDS = 60;
 
     /** Longest output kept per command, so a chatty script cannot fill the database. */
     private const OUTPUT_LIMIT = 4000;
@@ -58,20 +66,55 @@ final class AgentService
         if (! $agent->isOnline() && $userId !== null) {
             throw ApiException::conflict('AGENT_003', 'The agent has not checked in recently. Make sure it is running on the server.');
         }
-        $name = $agent->actionFor('backup', $action);
+        // A robocopy or rsync job is run by the agent's built-in action from the job's own scope, so folders are set once, on the job.
+        $builtin = $action === null && in_array($job->backup_method, ['robocopy', 'rsync'], true) && ($agent->actions[$job->backup_method]['type'] ?? null) === $job->backup_method;
+        $name = $builtin ? $job->backup_method : $agent->actionFor('backup', $action);
         if ($name === null) {
             throw ApiException::badRequest($action ? "The agent has no backup action named \"$action\"." : 'The agent has no backup action. Add one to its config file.');
         }
         if (AgentCommand::where('backup_job_id', $job->id)->where('type', 'backup')->whereIn('status', ['pending', 'running'])->exists()) {
             throw ApiException::conflict('AGENT_004', 'A backup is already queued or running for this job.');
         }
+        $job_part = $builtin ? self::builtinBackup($job, $agent) : [];
         $cmd = AgentCommand::create([
             'agent_id' => $agent->id, 'type' => 'backup', 'action' => $name, 'backup_job_id' => $job->id,
             'requested_by' => $userId, 'deadline_at' => now()->addHours(self::BACKUP_DEADLINE_HOURS),
-        ])->refresh();
+        ] + $job_part)->refresh();
         $job->forceFill(['status' => 'running', 'started_time' => now(), 'completed_time' => null, 'status_message' => null])->save();
 
         return $cmd;
+    }
+
+    /**
+     * What the agent's built-in robocopy or rsync needs, taken from the job: the folders, what to leave out, how they are laid out
+     * in the destination, and the location (as a key, never a path) with the job's folder inside it. Refuses a job that is not
+     * specific enough, rather than letting the agent guess.
+     *
+     * @return array<string, mixed>
+     */
+    private static function builtinBackup(BackupJob $job, Agent $agent): array
+    {
+        $why = fn (string $m) => ApiException::conflict('AGENT_007', "This job cannot be run by the agent's built-in {$job->backup_method} yet. $m");
+        $folders = $job->source_paths ?? [];
+        if ($job->scope_type !== 'folders' || ! $folders) {
+            throw $why('Set what it backs up to specific folders (a whole-server scope has no folder list to copy).');
+        }
+        if (! $job->layout) {
+            throw $why('Choose how the backup is laid out in the destination, so files land where restore tests expect them.');
+        }
+        BackupPaths::assertLayout($job->layout, $job->scope_type, $folders);
+        $location = $job->location_id ? BackupLocation::find($job->location_id) : null;
+        if (! $location) {
+            throw $why('Choose the backup location it writes to.');
+        }
+        if (! in_array($location->loc_key, $agent->locations ?? [], true)) {
+            throw $why("The agent does not know the location \"{$location->loc_key}\". Set its folder on the Agents page in BMS (Edit, then Locations), or give --location {$location->loc_key}=PATH when installing.");
+        }
+
+        return [
+            'location_key' => $location->loc_key, 'location_subpath' => $job->destination_path,
+            'payload' => ['layout' => $job->layout, 'folders' => array_values($folders), 'excluded' => array_values($job->excluded_paths ?? [])],
+        ];
     }
 
     /**
@@ -86,12 +129,17 @@ final class AgentService
         if ($name === null) {
             return [false, 'The agent has no restore_test action. Add one to its config file.'];
         }
+        // An agent only runs the tests it says it can. An older one would run a random restore and report it as the test that was asked for.
+        $type = $test->test_type;
+        if (! in_array($type, $agent->actions[$name]['tests'] ?? ['random_restore'], true)) {
+            return [false, "The agent (version {$agent->agent_version}) cannot run the $type test. Upgrade it to the latest agent."];
+        }
         // The job's location is sent as a key only. The agent turns it into a path from its own config, so BMS never sends a path.
         if ($locationKey !== null && ! in_array($locationKey, $agent->locations ?? [], true)) {
             return [false, "The agent does not know the location \"$locationKey\". Add it under \"locations\" in the agent's config file, then restart the agent."];
         }
         AgentCommand::create([
-            'agent_id' => $agent->id, 'type' => 'restore_test', 'action' => $name, 'location_key' => $locationKey, 'location_subpath' => $locationKey ? $subpath : null, 'payload' => $source, 'test_execution_id' => $test->id,
+            'agent_id' => $agent->id, 'type' => 'restore_test', 'test_type' => $type, 'action' => $name, 'location_key' => $locationKey, 'location_subpath' => $locationKey ? $subpath : null, 'payload' => $source, 'test_execution_id' => $test->id,
             'backup_job_id' => $test->backup_job_id, 'requested_by' => $test->executed_by, 'deadline_at' => now()->addHours(self::TEST_DEADLINE_HOURS),
         ]);
 
@@ -106,17 +154,55 @@ final class AgentService
         return DB::transaction(function () use ($agent, $info) {
             $agent->forceFill([
                 'last_seen_at' => now(), 'agent_version' => $info['version'] ?? null, 'os_info' => $info['os'] ?? null,
-                'actions' => $info['actions'] ?? [], 'locations' => array_values($info['locations'] ?? []), 'source_roots' => array_values($info['source_roots'] ?? []),
+                'actions' => $info['actions'] ?? [], 'remote_actions' => $info['remote_actions'] ?? null, 'locations' => array_values($info['locations'] ?? []), 'source_roots' => array_values($info['source_roots'] ?? []),
             ])->save();
             if (! empty($info['busy'])) {
                 return null; // a heartbeat from an agent that is already running something
             }
+            // An idle agent that BMS thinks is running something has lost it (the service or the machine restarted, and the copy died
+            // with it). Say so now instead of waiting hours for the deadline.
+            self::failLost($agent);
             $cmd = AgentCommand::where('agent_id', $agent->id)->where('status', 'pending')->where('deadline_at', '>', now())
                 ->orderBy('id')->lockForUpdate()->first();
-            $cmd?->forceFill(['status' => 'running', 'started_at' => now()])->save();
+            $cmd?->forceFill(['status' => 'running', 'started_at' => now(), 'deadline_at' => now()->addSeconds(self::runLimitSeconds($agent, $cmd))])->save();
 
             return $cmd;
         });
+    }
+
+    /**
+     * How long a command may run once it has started: the limit its action advertises plus a margin, so a backup that is allowed 24 hours
+     * is not written off after 8. An agent that does not say gets the default for that kind of command.
+     */
+    public static function runLimitSeconds(Agent $agent, AgentCommand $cmd): int
+    {
+        $default = ($cmd->type === 'backup' ? self::BACKUP_DEADLINE_HOURS : self::TEST_DEADLINE_HOURS) * 3600;
+        $action = $agent->actions[$cmd->action] ?? [];
+        // A test can have its own limit (reading a whole backup takes far longer than restoring one file).
+        $advertised = (int) (($cmd->type === 'restore_test' ? ($action['test_timeouts'][$cmd->test_type ?? 'random_restore'] ?? null) : null) ?? $action['timeout_seconds'] ?? 0);
+
+        return $advertised > 0 ? $advertised + self::RUN_MARGIN_MINUTES * 60 : $default;
+    }
+
+    /** Fail every command BMS thinks this agent is running, for an agent that just reported it is idle. */
+    private static function failLost(Agent $agent): void
+    {
+        $lost = AgentCommand::where('agent_id', $agent->id)->where('status', 'running')->where('started_at', '<=', now()->subSeconds(self::ORPHAN_GRACE_SECONDS))->lockForUpdate()->get();
+        foreach ($lost as $cmd) {
+            self::finishUnreported($cmd, 'failed', 'The agent restarted or lost this before it finished, so the result is unknown. Check the server, then run it again.');
+        }
+    }
+
+    /** End a command that never reported a result, and fail whatever it was for. */
+    private static function finishUnreported(AgentCommand $cmd, string $status, string $why): void
+    {
+        $cmd->forceFill(['status' => $status, 'completed_at' => now(), 'output' => $why])->save();
+        if ($cmd->type === 'backup' && ($job = BackupJob::find($cmd->backup_job_id))) {
+            $job->forceFill(['status' => 'failed', 'completed_time' => now(), 'status_message' => $why])->save();
+            TestResults::notifyAdmins('backup_failed', 'Backup did not run', $why, 'backup_job', $job->id);
+        } elseif ($cmd->test_execution_id) {
+            self::record($cmd->test_execution_id, ['success' => false, 'failure_type' => $status === 'expired' ? 'timeout' : 'restore_failed', 'severity' => 'high', 'error_message' => $why]);
+        }
     }
 
     /**
@@ -164,7 +250,13 @@ final class AgentService
 
     private static function finishRestoreTest(AgentCommand $cmd, bool $ok, array $d): void
     {
-        $result = ['success' => $ok, 'hash_algorithm' => $d['hash_algorithm'] ?? null, 'hash_original' => $d['hash_original'] ?? null,
+        // The agent ran it but found nothing it could judge (for example no file whose source it may read). That is a skip, never a pass.
+        if (! empty($d['skip_reason'])) {
+            TestResults::skip($cmd->test_execution_id, (string) $d['skip_reason']);
+
+            return;
+        }
+        $result = ['summary' => $d['summary'] ?? null, 'details' => array_intersect_key($d, array_flip(['files', 'bytes', 'free_bytes'])) ?: null, 'success' => $ok, 'hash_algorithm' => $d['hash_algorithm'] ?? null, 'hash_original' => $d['hash_original'] ?? null,
             'hash_restored' => $d['hash_restored'] ?? null, 'failed_item' => $d['failed_item'] ?? null, 'error_message' => $d['error_message'] ?? null,
             'source_status' => $d['source_status'] ?? null, 'source_note' => $d['source_note'] ?? null];
         if (! $ok) {
@@ -188,17 +280,24 @@ final class AgentService
         return CompanyContext::run($companyId, function () {
             $n = 0;
             foreach (AgentCommand::whereIn('status', ['pending', 'running'])->where('deadline_at', '<=', now())->get() as $cmd) {
-                DB::transaction(function () use ($cmd) {
-                    $why = $cmd->status === 'pending' ? 'The agent did not pick this up in time. It may be offline.' : 'The agent started this but never reported back.';
-                    $cmd->forceFill(['status' => 'expired', 'completed_at' => now(), 'output' => $why])->save();
-                    if ($cmd->type === 'backup' && ($job = BackupJob::find($cmd->backup_job_id))) {
-                        $job->forceFill(['status' => 'failed', 'completed_time' => now(), 'status_message' => $why])->save();
-                        TestResults::notifyAdmins('backup_failed', 'Backup did not run', $why, 'backup_job', $job->id);
-                    } elseif ($cmd->test_execution_id) {
-                        self::record($cmd->test_execution_id, ['success' => false, 'failure_type' => 'timeout', 'severity' => 'high', 'error_message' => $why]);
+                $expired = DB::transaction(function () use ($cmd) {
+                    // An agent works through one command at a time. A command waiting behind a long backup has not been ignored, it is queued,
+                    // so it keeps waiting for as long as that backup is still within its own time. Otherwise a test would be recorded as a
+                    // timeout failure for a backup that is perfectly fine.
+                    if ($cmd->status === 'pending') {
+                        $ahead = AgentCommand::where('agent_id', $cmd->agent_id)->where('status', 'running')->where('deadline_at', '>', now())->orderByDesc('deadline_at')->first();
+                        if ($ahead) {
+                            $cmd->forceFill(['deadline_at' => CarbonImmutable::instance($ahead->deadline_at)->addHours(self::TEST_DEADLINE_HOURS)])->save();
+
+                            return false;
+                        }
                     }
+                    $why = $cmd->status === 'pending' ? 'The agent did not pick this up in time. It may be offline.' : 'The agent started this but never reported back within its time limit.';
+                    self::finishUnreported($cmd, 'expired', $why);
+
+                    return true;
                 });
-                $n++;
+                $n += $expired ? 1 : 0;
             }
 
             return $n;

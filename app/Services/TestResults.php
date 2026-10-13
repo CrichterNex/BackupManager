@@ -63,6 +63,8 @@ final class TestResults
                 'hash_restored' => $rest,
                 'hash_match' => ($orig === null || $rest === null) ? null : $orig === $rest,
                 'error_message' => $r['error_message'] ?? null,
+                'summary' => isset($r['summary']) ? mb_substr((string) $r['summary'], 0, 500) : null,
+                'details' => $r['details'] ?? null,
                 'source_status' => $r['source_status'] ?? null,
                 'source_note' => isset($r['source_note']) ? mb_substr($r['source_note'], 0, 500) : null,
             ])->save();
@@ -105,6 +107,32 @@ final class TestResults
             }
 
             return ['retry_scheduled' => false];
+        });
+    }
+
+    /**
+     * Turn a recorded pass into a failure because a second person reviewing the evidence rejected it. This is the only way a recorded result
+     * changes. The failure is raised and the admins told exactly as for any other failure, and server health follows.
+     */
+    public static function overturn(int $testId, string $reason, int $reviewerId): void
+    {
+        DB::transaction(function () use ($testId, $reason) {
+            $exec = BackupTestExecution::lockForUpdate()->find($testId);
+            if (! $exec || $exec->test_status !== 'success') {
+                throw new RuntimeException("Test $testId is not a recorded pass");
+            }
+            $message = "Evidence rejected on review: $reason";
+            $exec->forceFill(['test_status' => 'failed', 'error_message' => $message])->save();
+            $job = BackupJob::withTrashed()->find($exec->backup_job_id);
+            if ($job) {
+                $job->forceFill(['test_status' => 'failed'])->save();
+                Server::whereKey($job->server_id)->update(['last_test_time' => now(), 'last_test_status' => 'failed', 'updated_at' => now()]);
+            }
+            $failure = BackupTestFailure::create([
+                'test_execution_id' => $exec->id, 'failure_type' => 'restore_failed', 'severity' => 'high',
+                'failed_item' => $exec->target ?? $job?->id, 'error_message' => $message,
+            ]);
+            self::notifyAdmins('test_failed', "Backup test failed on review ({$exec->test_type})", $message, 'test_failure', $failure->id);
         });
     }
 

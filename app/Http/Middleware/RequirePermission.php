@@ -12,7 +12,7 @@ class RequirePermission
 {
     public function handle(Request $request, Closure $next, string $permission): Response
     {
-        if (! Permissions::can($request->user()->role, $permission)) {
+        if (! Permissions::can($request->user()->effectiveRole(), $permission)) {
             throw ApiException::forbidden();
         }
 

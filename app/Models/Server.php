@@ -36,6 +36,8 @@ class Server extends Model
     {
         return [
             'backup_methods' => 'array',
+            'test_targets' => 'array',
+            'reference_items' => 'array',
             'active' => 'boolean',
             'retention_policy_days' => 'integer',
             'last_backup_time' => 'datetime',

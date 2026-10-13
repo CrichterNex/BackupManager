@@ -30,7 +30,9 @@ final class Audit
         $companyId = $actor['company_id'] ?? CompanyContext::id() ?? $user?->company_id;
         $userId = $actor['user_id'] ?? $user?->id;
         if ($user && ! $actor && $companyId !== null && $user->company_id !== $companyId) {
-            $details = ($details ?? []) + ['via_platform_admin' => true, 'home_company_id' => $user->company_id];
+            // Say how this person came to be in another company: as a platform admin, or through an access grant.
+            $via = $user->is_platform_admin ? 'via_platform_admin' : 'via_access_grant';
+            $details = ($details ?? []) + [$via => true, 'home_company_id' => $user->company_id];
         }
         $row = [
             'user_id' => $userId,

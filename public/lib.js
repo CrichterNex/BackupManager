@@ -28,18 +28,24 @@ const actingHeader = () => (getActing() ? { 'X-Acting-Company': getActing() } : 
 
 let onUnauthorized = () => {};
 export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn; };
+let onMfaRequired = () => {};
+export const setMfaRequiredHandler = (fn) => { onMfaRequired = fn; };
 
 export async function api(method, path, body) {
   const res = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
-    headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}), ...actingHeader() },
-    body: body ? JSON.stringify(body) : undefined,
+    // A form (a file upload) is sent as it is, so the browser sets the right content type and boundary.
+    headers: { Accept: 'application/json', ...(body && !(body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...actingHeader() },
+    body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => null);
   if (!res.ok) {
-    if (res.status === 401 && !path.startsWith('/auth/login')) onUnauthorized();
+    // A wrong two-step code is a 401 too, but the session is fine: do not treat it as the session ending.
+    const code = data?.error_code ?? '';
+    if (res.status === 401 && !path.startsWith('/auth/login') && !code.startsWith('MFA_')) onUnauthorized();
+    if (res.status === 403 && code === 'MFA_REQUIRED') onMfaRequired();
     throw new ApiError(res.status, data);
   }
   return data;
@@ -103,7 +109,10 @@ export function formModal({ title, fields, submitLabel = 'Save', onSubmit }) {
         input = h('input', { id: `f_${f.name}`, type: f.type ?? 'text', autocomplete: f.type === 'password' ? 'new-password' : 'off', value: f.value ?? '' });
       }
       inputs[f.name] = input;
-      return h('div', { class: 'field' }, h('label', { for: `f_${f.name}` }, f.label, f.required ? ' *' : ''), input, f.hint && h('div', { class: 'hint' }, f.hint));
+      // A select can explain each choice: the text under it follows what is picked.
+      const help = f.help && f.type === 'select' ? h('div', { class: 'hint' }) : null;
+      if (help) { const show = () => { help.textContent = f.help[input.value] ?? ''; }; input.addEventListener('change', show); show(); }
+      return h('div', { class: 'field' }, h('label', { for: `f_${f.name}` }, f.label, f.required ? ' *' : ''), input, help, f.hint && h('div', { class: 'hint' }, f.hint));
     });
     const close = (v) => { overlay.remove(); resolve(v); };
     const submit = h('button', { class: 'primary', type: 'submit' }, submitLabel);
@@ -121,7 +130,7 @@ export function formModal({ title, fields, submitLabel = 'Save', onSubmit }) {
       try { await onSubmit(values); close(true); }
       catch (ex) { err.hidden = false; err.textContent = errMessage(ex); submit.disabled = false; }
     });
-    const overlay = h('div', { class: 'overlay', onclick: (e) => e.target === overlay && close(false), onkeydown: (e) => e.key === 'Escape' && close(false) }, h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' }, form));
+    const overlay = h('div', { class: 'overlay', onkeydown: (e) => e.key === 'Escape' && close(false) }, h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' }, form));
     document.body.append(overlay);
     overlay.querySelector('input,select,textarea')?.focus();
   });

@@ -9,7 +9,7 @@ final class Scope
     /** Technicians only see rows for servers assigned to them. Admins and managers see everything. */
     public static function technician($query, User $user, string $serverIdColumn)
     {
-        if ($user->role !== 'company_technician') {
+        if ($user->effectiveRole() !== 'company_technician') {
             return $query;
         }
 

@@ -1,10 +1,9 @@
-import { api, getActing, setActing, h, setUnauthorizedHandler, toast, errMessage, badge, table, label, fmtAgo, fmtDate, formModal, confirmModal } from './lib.js';
+import { api, getActing, setActing, h, setUnauthorizedHandler, setMfaRequiredHandler, toast, errMessage, badge, table, label, fmtAgo, fmtDate, formModal, confirmModal } from './lib.js';
 
 const METHODS = ['rsync', 'robocopy', 'windows_manual_copy', 'linux_manual_copy', 'manual_copy', 'acronis', 'veeam', 'commvault', 'acronis_m365', 'microsoft_native_365', 'aws_backup', 'azure_backup'];
 // BMS-managed copies go to a backup location. Every other method belongs to a platform that has its own locations.
 const LOCATION_METHODS = ['rsync', 'robocopy', 'windows_manual_copy', 'linux_manual_copy', 'manual_copy'];
 const LOCATION_KINDS = ['local_disk', 'network_share', 'nas', 'external_drive', 'offsite', 'other'];
-const TEST_TYPES = ['synthetic_file', 'random_restore', 'full_recovery', 'database_integrity', 'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions'];
 const opts = (list) => list.map((v) => ({ value: v, label: label(v) }));
 const ROLE_LABEL = { company_admin: 'Admin', company_manager: 'Manager', company_technician: 'Technician' };
 
@@ -23,6 +22,7 @@ const PAGES = [
   { id: 'users', title: 'Users', render: users, admin: true },
   { id: 'integrations', title: 'Integrations', render: integrations, admin: true },
   { id: 'companies', title: 'Companies', render: companies, platform: true },
+  { id: 'people', title: 'People', render: people, platform: true },
   { id: 'audit', title: 'Audit log', render: auditLog, admin: true },
   { id: 'profile', title: 'My profile', render: profile },
 ];
@@ -52,11 +52,30 @@ async function show() {
   refreshUnread();
 }
 
+// For people who were granted access to other companies: a picker for the company they are working in. (Platform admins
+// use the Companies page instead, because they can reach every company.)
+function companySwitcher() {
+  if (me.platform || !(me.access ?? []).length) return null;
+  const home = me.home ?? { id: me.company.id, name: me.company.company_name };
+  const current = getActing() ? Number(getActing()) : home.id;
+  const select = h('select', { 'aria-label': 'Company', onchange: async (e) => {
+    const id = Number(e.target.value);
+    if (id === home.id) { setActing(null); } else {
+      try { await api('POST', `/me/companies/${id}/enter`); } catch (err) { e.target.value = String(current); return toast(errMessage(err), true); }
+      setActing(id);
+    }
+    history.replaceState({}, '', '/');
+    location.reload();
+  } }, [{ id: home.id, name: `${home.name} (my company)` }, ...me.access].map((c) => h('option', { value: String(c.id), selected: c.id === current }, c.name)));
+  return h('div', { class: 'field', style: 'margin:8px 0' }, h('label', { class: 'small muted' }, 'Company'), select);
+}
+
 function sidebar(page) {
   return h('nav', { class: 'side', 'aria-label': 'Main' },
     h('div', { class: 'brand' }, h('strong', {}, me.company.company_name), h('span', {}, `${ROLE_LABEL[me.role]} · ${me.user.username}`)),
-    me.acting && h('div', { class: 'error', role: 'status', style: 'margin:8px 0' }, `Working inside ${me.company.company_name} as a platform admin. Your changes are recorded in its audit log. `,
+    me.acting && h('div', { class: 'error', role: 'status', style: 'margin:8px 0' }, `Working inside ${me.company.company_name} ${me.platform ? 'as a platform admin' : `with the access you were granted (${ROLE_LABEL[me.role]})`}. Your changes are recorded in its audit log. `,
       h('button', { class: 'link', onclick: () => { setActing(null); location.assign('/'); } }, 'Back to my company')),
+    companySwitcher(),
     PAGES.filter(visible).map((p) =>
       h('a', { class: `nav${p.id === page.id ? ' active' : ''}`, href: `/companies/${me.company.company_slug}/${p.id}`, 'aria-current': p.id === page.id ? 'page' : false,
         onclick: (e) => { e.preventDefault(); go(p.id); } }, p.title)),
@@ -64,6 +83,59 @@ function sidebar(page) {
     h('div', { class: 'spacer' }),
     h('button', { onclick: logout }, 'Log out'));
 }
+
+// --- live pages ---
+// Every few seconds the current page is rebuilt in the background and swapped in only if something changed, so statuses move
+// without a reload. It never interrupts: nothing happens while a dialog is open, a field has been edited, a section is
+// expanded, text is selected, or the tab is hidden. A failed refresh keeps what is on screen.
+const LIVE_SECONDS = 15;
+let liveBusy = false;
+let liveStamp = null;
+
+function liveIndicator(ok) {
+  if (!liveStamp) {
+    liveStamp = h('div', { class: 'live', role: 'status', 'aria-live': 'off', style: 'position:fixed;right:12px;bottom:8px;font-size:11px;opacity:.6;pointer-events:none' });
+    document.body.append(liveStamp);
+  }
+  liveStamp.textContent = ok ? `Live · updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : 'Live · connection lost, retrying';
+}
+
+// True while the person could lose something by the page being rebuilt.
+function liveShouldWait(view) {
+  if (document.visibilityState !== 'visible' || document.querySelector('.overlay')) return true;
+  if (view.querySelector('details[open]')) return true;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && view.contains(sel.anchorNode)) return true;
+  for (const el of view.querySelectorAll('input, textarea, select')) {
+    if (el === document.activeElement) return true;
+    if (el.tagName === 'SELECT') { if ([...el.options].some((o) => o.selected !== o.defaultSelected)) return true; }
+    else if (el.type === 'checkbox' || el.type === 'radio') { if (el.checked !== el.defaultChecked) return true; }
+    else if (el.value !== el.defaultValue) return true;
+  }
+  return false;
+}
+
+async function liveRefresh() {
+  const view = document.getElementById('view');
+  if (!me || !view || liveBusy || liveShouldWait(view)) return;
+  liveBusy = true;
+  const page = currentPage();
+  try {
+    const next = await page.render();
+    // Do not apply a result that arrived after the person moved on, opened a dialog or started typing.
+    if (currentPage().id !== page.id || document.getElementById('view') !== view || liveShouldWait(view)) return;
+    if (next.innerHTML !== view.firstElementChild?.innerHTML || view.children.length !== 1) {
+      const y = window.scrollY;
+      view.replaceChildren(next);
+      window.scrollTo(0, y);
+    }
+    liveIndicator(true);
+    refreshUnread();
+  } catch { liveIndicator(false); }
+  finally { liveBusy = false; }
+}
+setInterval(liveRefresh, LIVE_SECONDS * 1000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') liveRefresh(); });
 
 async function refreshUnread() {
   try {
@@ -89,8 +161,8 @@ function loginScreen() {
     e.preventDefault(); btn.disabled = true; err.hidden = true;
     try {
       const r = await api('POST', '/auth/login', { username: user.value.trim(), password: pass.value });
-      me = { user: r.user, company: r.company, role: r.role, platform: r.platform_admin };
-      show();
+      if (r.mfa_required) { mfaCodeScreen(r.mfa_token); return; }
+      await finishLogin(r);
     } catch (ex) { err.hidden = false; err.textContent = ex.message; btn.disabled = false; pass.value = ''; pass.focus(); }
   } },
   err, h('div', { class: 'field' }, h('label', { for: 'u' }, 'Username'), user), h('div', { class: 'field' }, h('label', { for: 'p' }, 'Password'), pass), btn);
@@ -98,7 +170,150 @@ function loginScreen() {
   user.focus();
 }
 
+// --- two-step sign-in ---
+// After the password, a code from the authenticator app (or, if the phone is lost, a one-time recovery code).
+function mfaCodeScreen(mfaToken) {
+  let recovery = false;
+  const err = h('div', { class: 'error', hidden: true, role: 'alert' });
+  const input = h('input', { id: 'mfa-code', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '7', required: true, placeholder: '123456' });
+  const labelEl = h('label', { for: 'mfa-code' }, 'Code from your authenticator app');
+  const toggle = h('button', { type: 'button', class: 'link' }, 'Lost your phone? Use a recovery code');
+  const btn = h('button', { class: 'primary', type: 'submit', style: 'width:100%' }, 'Verify');
+  toggle.onclick = () => {
+    recovery = !recovery;
+    input.value = ''; input.maxLength = recovery ? 30 : 7; input.placeholder = recovery ? 'xxxxx-xxxxx' : '123456';
+    input.setAttribute('inputmode', recovery ? 'text' : 'numeric');
+    labelEl.textContent = recovery ? 'One-time recovery code' : 'Code from your authenticator app';
+    toggle.textContent = recovery ? 'Use the authenticator app instead' : 'Lost your phone? Use a recovery code';
+    input.focus();
+  };
+  const form = h('form', { onsubmit: async (e) => {
+    e.preventDefault(); btn.disabled = true; err.hidden = true;
+    try {
+      const r = await api('POST', '/auth/mfa/verify', { mfa_token: mfaToken, ...(recovery ? { recovery_code: input.value.trim() } : { code: input.value.trim() }) });
+      await finishLogin(r);
+    } catch (ex) {
+      if (ex.body?.error_code === 'MFA_001') { loginScreen(); toast(ex.message, true); return; }
+      err.hidden = false; err.textContent = ex.message; btn.disabled = false; input.value = ''; input.focus();
+    }
+  } }, err, h('div', { class: 'field' }, labelEl, input), btn, h('div', { style: 'margin-top:10px;display:flex;justify-content:space-between' }, toggle,
+    h('button', { type: 'button', class: 'link', onclick: loginScreen }, 'Back')));
+  root.replaceChildren(h('div', { class: 'login' }, h('div', { class: 'card' }, h('h1', {}, 'Two-step sign-in'), h('p', { class: 'muted' }, 'Enter the 6-digit code from your authenticator app.'), form)));
+  input.focus();
+}
+
+// The same steps whether they fill the screen (setup is required) or sit in a dialog (changing the app from the profile).
+//   1. scan the QR code (or type the secret)   2. prove it with a code   3. keep the recovery codes
+async function mfaSetupFlow(container, { proof = null, onDone }) {
+  const box = h('div', {});
+  container.replaceChildren(box);
+  const fail = (e) => toast(errMessage(e), true);
+  let setup;
+  try { setup = (await api('POST', '/me/mfa/setup', proof ?? undefined)).data; } catch (e) { fail(e); return false; }
+  const grouped = setup.secret.match(/.{1,4}/g).join(' ');
+  const err = h('div', { class: 'error', hidden: true, role: 'alert' });
+  const code = h('input', { id: 'mfa-setup-code', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '7', placeholder: '123456', required: true });
+  const btn = h('button', { class: 'primary', type: 'submit' }, 'Turn on');
+  const qr = h('img', { alt: 'QR code for your authenticator app', width: '200', height: '200', src: `data:image/svg+xml;utf8,${encodeURIComponent(setup.qr_svg)}`, style: 'background:#fff;border-radius:6px;padding:6px' });
+  box.append(
+    h('ol', { style: 'padding-left:18px;line-height:1.6' },
+      h('li', {}, 'Install an authenticator app on your phone (Microsoft Authenticator, Google Authenticator, Authy or similar).'),
+      h('li', {}, 'In the app, add an account and scan this code:')),
+    h('div', { style: 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:8px 0' }, qr,
+      h('div', {}, h('div', { class: 'small muted' }, 'Cannot scan? Type this key into the app instead:'), h('code', { style: 'word-break:break-all;user-select:all' }, grouped))),
+    h('form', { onsubmit: async (e) => {
+      e.preventDefault(); btn.disabled = true; err.hidden = true;
+      try {
+        const r = await api('POST', '/me/mfa/enable', { code: code.value.trim() });
+        showRecoveryCodes(box, r.recovery_codes, onDone);
+      } catch (ex) { err.hidden = false; err.textContent = ex.message; btn.disabled = false; code.value = ''; code.focus(); }
+    } }, err, h('div', { class: 'field' }, h('label', { for: 'mfa-setup-code' }, 'Then enter the 6-digit code the app shows'), code), btn));
+  code.focus();
+  return true;
+}
+
+function showRecoveryCodes(box, codes, onDone) {
+  const text = codes.join('\n');
+  const saved = h('input', { type: 'checkbox', id: 'mfa-saved' });
+  const cont = h('button', { class: 'primary', disabled: true, onclick: onDone }, 'Continue');
+  saved.onchange = () => { cont.disabled = !saved.checked; };
+  box.replaceChildren(
+    h('h3', {}, 'Save your recovery codes'),
+    h('p', {}, 'If you lose your phone, each of these signs you in once. Keep them somewhere safe and private. They are shown only now.'),
+    h('pre', { style: 'columns:2;background:rgba(127,127,127,.15);padding:12px;border-radius:6px;user-select:all' }, text),
+    h('div', { class: 'row' },
+      h('button', { onclick: () => copyText(text) }, 'Copy'),
+      h('button', { onclick: () => { const a = h('a', { href: `data:text/plain;charset=utf-8,${encodeURIComponent(`BMS recovery codes for ${me.user.username}\n\n${text}\n`)}`, download: 'bms-recovery-codes.txt' }); document.body.append(a); a.click(); a.remove(); } }, 'Download')),
+    h('label', { style: 'display:block;margin:12px 0' }, saved, ' I have saved these codes'),
+    cont);
+}
+
+// When two-step sign-in is required and not set up yet, this is the only thing the person can do.
+function mfaSetupScreen() {
+  const holder = h('div', {});
+  root.replaceChildren(h('div', { class: 'login' }, h('div', { class: 'card', style: 'max-width:520px' },
+    h('h1', {}, 'Set up two-step sign-in'),
+    h('p', { class: 'muted' }, 'Your organisation requires a code from an authenticator app when you sign in. Set it up now to continue.'),
+    holder, h('div', { style: 'margin-top:14px' }, h('button', { class: 'link', onclick: logout }, 'Log out')))));
+  mfaSetupFlow(holder, { onDone: async () => { await loadMe(); show(); } });
+}
+
+// Ask for the password and a current code before changing anything about two-step sign-in. Resolves with the proof.
+const mfaProof = (title) => new Promise((resolve) => {
+  let proof = null;
+  formModal({
+    title, submitLabel: 'Continue',
+    fields: [{ name: 'password', label: 'Your password', type: 'password', required: true }, { name: 'code', label: 'Current code from your authenticator app', required: true }],
+    onSubmit: async (v) => { proof = { password: v.password, code: v.code.trim() }; },
+  }).then((ok) => resolve(ok ? proof : null));
+});
+
+async function changeAuthenticator() {
+  const proof = await mfaProof('Change authenticator app');
+  if (!proof) return;
+  const overlay = h('div', { class: 'overlay' });
+  const dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', style: 'max-width:560px' }, h('h2', {}, 'Change authenticator app'), h('div', {}));
+  overlay.append(dialog);
+  document.body.append(overlay);
+  const ok = await mfaSetupFlow(dialog.lastChild, { proof, onDone: async () => { overlay.remove(); toast('Authenticator app changed'); await loadMe(); show(); } });
+  if (!ok) overlay.remove();
+}
+
+async function newRecoveryCodes() {
+  const proof = await mfaProof('New recovery codes');
+  if (!proof) return;
+  let r;
+  try { r = await api('POST', '/me/mfa/recovery-codes', proof); } catch (e) { return toast(errMessage(e), true); }
+  const overlay = h('div', { class: 'overlay' });
+  const dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', style: 'max-width:560px' }, h('h2', {}, 'New recovery codes'), h('div', {}));
+  overlay.append(dialog);
+  document.body.append(overlay);
+  showRecoveryCodes(dialog.lastChild, r.recovery_codes, async () => { overlay.remove(); await loadMe(); show(); });
+}
+
+async function turnOffMfa() {
+  const proof = await mfaProof('Turn off two-step sign-in');
+  if (proof && await act(() => api('POST', '/me/mfa/disable', proof), 'Two-step sign-in turned off')) { await loadMe(); show(); }
+}
+
+// Reload who I am (including two-step state and the companies I can switch into).
+async function loadMe() {
+  const r = (await api('GET', '/me')).data;
+  me = {
+    id: r.id, user: { username: r.username, email: r.email }, company: { id: r.company_id, company_name: r.company_name, company_slug: r.company_slug },
+    role: r.role, platform: r.platform_admin, acting: r.acting_in_other_company, home: r.home_company, access: r.access ?? [], mfa: r.mfa,
+  };
+}
+
+// After the password (and the code, if one was needed) the person is in.
+async function finishLogin(r) {
+  me = { id: r.user.id, user: r.user, company: r.company, role: r.role, platform: r.platform_admin, access: [], mfa: { setup_required: r.mfa_setup_required } };
+  try { await loadMe(); } catch (e) { /* keep what the login gave us */ }
+  if (me.mfa?.setup_required) mfaSetupScreen(); else show();
+}
+
 async function logout() { await api('POST', '/auth/logout').catch(() => {}); setActing(null); history.replaceState({}, '', '/'); loginScreen(); }
+setMfaRequiredHandler(() => { if (me) mfaSetupScreen(); });
 setUnauthorizedHandler(() => { if (me) { toast('Your session has ended. Please log in again.', true); history.replaceState({}, '', '/'); loginScreen(); } });
 
 // --- dashboard ---
@@ -152,17 +367,23 @@ const select = (name, key, state, load, options) =>
   h('select', { 'aria-label': name, onchange: (e) => { state[key] = e.target.value; load(); } }, options.map(([v, t]) => h('option', { value: v }, t)));
 
 const serverFields = (s = {}) => [
-  { name: 'hostname', label: 'Hostname', required: true, value: s.hostname },
+  { name: 'hostname', label: 'Hostname', required: true, value: s.hostname, hint: 'For a Microsoft 365 tenant, a short name such as contoso-365.' },
   { name: 'ip_address', label: 'IP address', value: s.ip_address ?? '' },
-  { name: 'os_type', label: 'Operating system', type: 'select', options: [{ value: 'linux', label: 'Linux' }, { value: 'windows', label: 'Windows' }], value: s.os_type },
+  { name: 'os_type', label: 'Operating system', type: 'select', options: [{ value: 'linux', label: 'Linux' }, { value: 'windows', label: 'Windows' }, { value: 'microsoft_365', label: 'Microsoft 365 tenant (no machine)' }], value: s.os_type },
+  { name: 'timezone', label: 'Time zone of the backup console', value: s.timezone ?? (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'), hint: 'For example Africa/Johannesburg or UTC. Tests by hand pick a day in this zone and read the dates entered in it.' },
   { name: 'criticality', label: 'Criticality', type: 'select', options: opts(['standard', 'critical', 'non-critical']), value: s.criticality },
   { name: 'backup_methods', label: 'Backup methods', type: 'checks', options: opts(METHODS), value: s.backup_methods ?? [] },
   { name: 'retention_policy_days', label: 'Retention (days)', type: 'number', value: s.retention_policy_days ?? '', hint: 'Leave empty to keep indefinitely' },
   { name: 'notes', label: 'Notes', type: 'textarea', value: s.notes ?? '' },
+  { name: 'test_targets', label: 'Test mailboxes or sites to sample (Microsoft 365 only)', type: 'textarea', value: (s.test_targets ?? []).join('\n'), hint: 'One per line. Use dedicated test mailboxes, never real people\u2019s, so nobody\u2019s mail is read and nobody has to give permission. Each test by hand samples one, the one tested least recently. A tenant has no IP address or agent and can only use the Microsoft 365 backup methods.' },
+  { name: 'reference_items', label: 'Reference items (Microsoft 365 only)', type: 'textarea', value: (s.reference_items ?? []).map((r) => `${r.label} | ${r.hash} | ${r.where ?? ''}`).join('\n'),
+    hint: 'Known files kept in the test mailboxes, one per line: name | fingerprint | where it is. Work out each file\u2019s SHA-256 once when you create it. A tester then restores it and enters only the restored copy\u2019s fingerprint, and BMS compares it with this one, so nobody needs the original or the mailbox owner. The mailbox must be in the backup, and the item must exist in a recovery point.' },
 ];
 const serverBody = (v) => ({
-  hostname: v.hostname.trim(), ip_address: v.ip_address.trim() || null, os_type: v.os_type, criticality: v.criticality,
+  hostname: v.hostname.trim(), ip_address: v.ip_address.trim() || null, os_type: v.os_type, timezone: v.timezone.trim() || 'UTC', criticality: v.criticality,
   backup_methods: v.backup_methods, retention_policy_days: v.retention_policy_days ? Number(v.retention_policy_days) : null, notes: v.notes.trim() || null,
+  test_targets: v.os_type === 'microsoft_365' ? v.test_targets.split('\n').map((x) => x.trim()).filter(Boolean) : null,
+  reference_items: v.os_type === 'microsoft_365' ? v.reference_items.split('\n').map((x) => x.trim()).filter(Boolean).map((line) => { const [label, hash, ...where] = line.split('|').map((p) => p.trim()); return { label, hash: hash ?? '', where: where.join(' | ') || null }; }) : null,
 });
 async function serverForm(existing) {
   const done = await formModal({
@@ -181,16 +402,16 @@ async function serverDetail(s) {
   overlay.append(h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' },
     h('h2', {}, full.hostname),
     h('table', {}, h('tbody', {},
-      row('Health', badge(full.status)), row('OS', label(full.os_type)), row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
+      row('Health', badge(full.status)), row('Type', full.os_type === 'microsoft_365' ? 'Microsoft 365 tenant' : label(full.os_type)), full.os_type !== 'microsoft_365' && row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
       row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
       row('Last backup', `${label(full.last_backup_status)} · ${fmtDate(full.last_backup_time)}`), row('Last test', `${label(full.last_test_status)} · ${fmtDate(full.last_test_time)}`),
-      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), row('Agent', agentSummary(full.agent)), row('Platforms', linksSummary(full.links)), row('Notes', full.notes ?? '—'))),
+      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), full.os_type !== 'microsoft_365' && row('Agent', agentSummary(full.agent)), full.os_type === 'microsoft_365' && row('Test mailboxes', (full.test_targets ?? []).join(', ') || 'None listed: choose one each time'), full.os_type === 'microsoft_365' && row('Reference items', (full.reference_items ?? []).map((r) => r.label).join(', ') || 'None: tests check the item opens, with no original to compare'), row('Platforms', linksSummary(full.links)), row('Notes', full.notes ?? '—'))),
     h('div', { class: 'actions' },
       isAdmin() && h('button', { class: 'danger', onclick: async () => {
         if (await confirmModal('Delete server?', `${full.hostname} and its backup jobs will be removed from view. History is kept for audit.`, 'Delete')) {
           overlay.remove(); if (await act(() => api('DELETE', `/servers/${full.id}`), 'Server deleted')) show();
         } } }, 'Delete'),
-      isAdmin() && (full.agent.enrolled
+      isAdmin() && full.os_type !== 'microsoft_365' && (full.agent.enrolled
         ? h('button', { onclick: async () => { if (await confirmModal('Remove agent?', `${full.hostname} will stop receiving backup and test commands. The agent software on the server keeps running until you stop it.`, 'Remove') && await act(() => api('DELETE', `/servers/${full.id}/agent`), 'Agent removed')) { overlay.remove(); show(); } } }, 'Remove agent')
         : h('button', { onclick: () => { overlay.remove(); enrollAgent(full); } }, 'Enroll agent')),
       isAdmin() && h('button', { onclick: () => { overlay.remove(); linkForm(full); } }, 'Link to platform device'),
@@ -242,6 +463,153 @@ const agentSummary = (a) => {
     a.agent_version ? ` · v${a.agent_version}` : '', actions.length ? ` · actions: ${actions.join(', ')}` : ' · no actions reported yet',
     (a.locations ?? []).length ? ` · locations: ${a.locations.join(', ')}` : '');
 };
+// --- agent actions managed in BMS ---
+// The commands BMS may start on a server. An admin edits them here instead of in the agent's config file. They run on that server
+// with the agent's rights (root / SYSTEM), so the dialog says so, and every change is written to the audit log.
+const commandText = (c) => (c ? c.join('\n') : '');
+const commandParts = (t) => t.split('\n').map((x) => x.replace(/\r$/, '')).filter((x, i) => i === 0 || x !== '');
+
+async function saveManaged(a, managed) {
+  const actions = {};
+  for (const [name, m] of Object.entries(managed)) actions[name] = { command: m.command, cwd: m.cwd ?? null, timeout_seconds: m.timeout_seconds ?? null };
+  return api('PUT', `/servers/${a.server_id}/agent/actions`, { actions });
+}
+
+async function actionForm(a, managed, name) {
+  const m = name ? managed[name] : null;
+  const done = await formModal({
+    title: name ? `Edit action "${name}"` : 'Add action', submitLabel: 'Save',
+    fields: [
+      { name: 'name', label: 'Action name', required: true, value: name ?? '', hint: name === 'backup' ? 'BMS starts the action named backup when you run a backup.' : 'Letters, numbers, dot, dash and underscore. Use "backup" for the one BMS starts by default.' },
+      { name: 'command', label: 'Command: the program on the first line, then one argument per line', type: 'textarea', required: true, value: commandText(m?.command),
+        hint: 'Run directly, not through a shell, so there is no quoting or && to worry about. Example: /usr/local/bin/backup.sh then --full on the next line. Do not put passwords here: they are stored in BMS and shown in the audit log.' },
+      { name: 'cwd', label: 'Working folder (optional)', value: m?.cwd ?? '' },
+      { name: 'timeout', label: 'Give up after (minutes)', value: String(Math.round((m?.timeout_seconds ?? 8 * 3600) / 60)) },
+    ],
+    onSubmit: async (v) => {
+      const n = v.name.trim();
+      if (name && n !== name) delete managed[name];
+      const mins = Number(v.timeout);
+      if (!Number.isFinite(mins) || mins < 1 || mins > 10080) throw new Error('The time limit must be between 1 minute and 7 days (10080 minutes).');
+      managed[n] = { type: 'command', command: commandParts(v.command), cwd: v.cwd.trim() || null, timeout_seconds: Math.round(mins * 60) };
+      await saveManaged(a, managed);
+    },
+  });
+  return done;
+}
+
+async function locationPathForm(a, mapped, bmsLocations, key) {
+  const free = bmsLocations.filter((l) => key === l.loc_key || !(l.loc_key in mapped));
+  if (!free.length) { toast('Every backup location already has a folder on this server. Add locations on the Locations page.', true); return false; }
+  return formModal({
+    title: key ? `Folder for "${key}"` : 'Set a location folder', submitLabel: 'Save',
+    fields: [
+      { name: 'key', label: 'Backup location', type: 'select', options: free.map((l) => ({ value: l.loc_key, label: `${l.name} (${l.loc_key})` })), value: key ?? free[0].loc_key },
+      { name: 'path', label: 'Folder on this server', required: true, value: key ? mapped[key] : '', hint: 'A full path as this server sees it, such as D:\\Backups, \\\\nas\\share\\backups or /mnt/nas/backups. Backups are written here and restore tests read from here.' },
+    ],
+    onSubmit: async (v) => {
+      const next = { ...mapped };
+      if (key && v.key !== key) delete next[key];
+      next[v.key] = v.path.trim();
+      await api('PUT', `/servers/${a.server_id}/agent/locations`, { locations: next });
+    },
+  });
+}
+
+async function sourceRootsForm(a, roots) {
+  return formModal({
+    title: 'Folders this agent may read', submitLabel: 'Save',
+    fields: [{ name: 'roots', label: 'One full folder path per line', type: 'textarea', value: roots.join('\n'),
+      hint: 'A job can only back up folders under these, and source comparison only reads under them. Subfolders are included. Example: D:\\Data or /srv/www. Leave empty to allow none.' }],
+    onSubmit: async (v) => {
+      const list = [...new Set(v.roots.split('\n').map((x) => x.trim()).filter(Boolean))];
+      await api('PUT', `/servers/${a.server_id}/agent/source-roots`, { source_roots: list });
+    },
+  });
+}
+
+async function credentialForm(a, users, bmsLocations) {
+  if (!bmsLocations.length) { toast('Add a backup location on the Locations page first.', true); return false; }
+  return formModal({
+    title: 'Sign-in for a network share', submitLabel: 'Save',
+    fields: [
+      { name: 'location', label: 'Backup location', type: 'select', options: bmsLocations.map((l) => ({ value: l.loc_key, label: `${l.name} (${l.loc_key})${l.loc_key in users ? ' \u2014 replaces ' + users[l.loc_key] : ''}` })) },
+      { name: 'username', label: 'User name', required: true, hint: 'For example DOMAIN\\svc-backup. Use a dedicated account that can only read and write the backup share.' },
+      { name: 'password', label: 'Password', type: 'password', required: true, hint: 'Stored encrypted in BMS and sent to the agent over HTTPS. It is never shown again, so to change it, enter it again.' },
+    ],
+    onSubmit: (v) => api('PUT', `/servers/${a.server_id}/agent/credentials`, { location: v.location, username: v.username.trim(), password: v.password }),
+  });
+}
+
+async function editActions(a) {
+  const draw = async () => {
+    const fresh = ((await api('GET', '/agents')).data.agents.find((x) => x.id === a.id)) ?? a;
+    const managed = structuredClone(fresh.managed_actions ?? {});
+    const fileOnly = Object.entries(fresh.actions ?? {}).filter(([n]) => !(n in managed));
+    const mapped = { ...(fresh.managed_locations ?? {}) };
+    const bmsLocations = (await api('GET', '/backup-locations')).data;
+    const fileLocs = (fresh.locations ?? []).filter((k) => !(k in mapped));
+    const credUsers = { ...(fresh.credential_users ?? {}) };
+    const roots = [...(fresh.managed_source_roots ?? [])];
+    const fileRoots = (fresh.source_roots ?? []).filter((r) => !roots.includes(r));
+    const note = fresh.remote_actions === false
+      ? h('p', { class: 'error' }, 'This agent was installed with remote actions turned off, so only its own config file decides what it runs. Re-install without --no-remote-actions to manage actions here.')
+      : fresh.remote_actions == null
+        ? h('p', { class: 'error' }, 'This agent is too old to take actions from BMS. On the server, run the new bms_agent.py with: --upgrade --enable-remote-actions')
+        : null;
+    const body = h('div', {},
+      h('p', { class: 'small muted' }, 'These commands run on the server with the agent’s rights (root or SYSTEM). The agent picks up a change within about a minute and no reinstall is needed. Changes are in the audit log.'),
+      note,
+      table([
+        { title: 'Action', render: ([n]) => h('code', {}, n) },
+        { title: 'Command', render: ([, m]) => (m.command ? h('code', { style: 'white-space:pre-wrap;word-break:break-all' }, m.command.join(' ')) : h('span', { class: 'muted' }, 'Not set up yet: runs nothing')) },
+        { title: '', render: ([n]) => h('span', { class: 'row' },
+          h('button', { class: 'link', onclick: async () => { if (await actionForm(fresh, managed, n)) { toast('Saved'); overlay.remove(); show(); } } }, 'Edit'),
+          h('button', { class: 'link', onclick: async () => {
+            if (!await confirmModal('Remove action?', `${n} will no longer be available from BMS.${n === 'backup' ? ' An empty backup action comes back so you can set it again.' : ''}`, 'Remove')) return;
+            delete managed[n];
+            if (await act(() => saveManaged(fresh, managed), 'Removed')) { overlay.remove(); show(); }
+          } }, 'Remove')) },
+      ], Object.entries(managed), { empty: 'None yet.' }),
+      fileOnly.length ? h('p', { class: 'small muted' }, 'Also on this agent, set in its config file: ', fileOnly.map(([n]) => n).join(', '), '.') : null,
+      h('h3', {}, 'Locations on this server'),
+      h('p', { class: 'small muted' }, 'Which folder each backup location means on this server. A location set in the agent\u2019s own config file takes priority over one set here.'),
+      table([
+        { title: 'Location', render: ([k]) => h('code', {}, k) },
+        { title: 'Folder', render: ([, p]) => h('code', { style: 'word-break:break-all' }, p) },
+        { title: '', render: ([k]) => h('span', { class: 'row' },
+          h('button', { class: 'link', onclick: async () => { if (await locationPathForm(fresh, mapped, bmsLocations, k)) { toast('Saved'); overlay.remove(); show(); } } }, 'Edit'),
+          h('button', { class: 'link', onclick: async () => {
+            const next = { ...mapped }; delete next[k];
+            if (await act(() => api('PUT', `/servers/${fresh.server_id}/agent/locations`, { locations: next }), 'Removed')) { overlay.remove(); show(); }
+          } }, 'Remove')) },
+      ], Object.entries(mapped), { empty: 'None set here.' }),
+      fileLocs.length ? h('p', { class: 'small muted' }, 'Set in the agent\u2019s config file: ', fileLocs.join(', '), '.') : null,
+      h('div', { class: 'row' }, h('button', { disabled: fresh.remote_actions === false, onclick: async () => { if (await locationPathForm(fresh, mapped, bmsLocations, null)) { toast('Saved'); overlay.remove(); show(); } } }, 'Set a location folder')),
+      h('h3', {}, 'Sign-in for network shares'),
+      h('p', { class: 'small muted' }, 'The account the agent uses to open a location that is a network share (Windows). Without one, the agent uses the account it runs as, which is usually SYSTEM and has no network access. Passwords are encrypted in BMS and never shown again. Anyone who controls BMS can obtain them, so use a dedicated account with access to the backup share only.'),
+      table([
+        { title: 'Location', render: ([k]) => h('code', {}, k) },
+        { title: 'Signs in as', render: ([, u]) => u },
+        { title: '', render: ([k]) => h('button', { class: 'link', onclick: async () => {
+          if (await act(() => api('PUT', `/servers/${fresh.server_id}/agent/credentials`, { location: k, remove: true }), 'Removed')) { overlay.remove(); show(); }
+        } }, 'Remove') },
+      ], Object.entries(credUsers), { empty: 'None set.' }),
+      h('div', { class: 'row' }, h('button', { disabled: fresh.remote_actions === false, onclick: async () => { if (await credentialForm(fresh, credUsers, bmsLocations)) { toast('Saved'); overlay.remove(); show(); } } }, 'Set a sign-in')),
+      h('h3', {}, 'Folders it may read'),
+      h('p', { class: 'small muted' }, 'The folders a robocopy or rsync job may back up, and the only ones source comparison reads. A folder not listed here is refused.'),
+      roots.length ? h('ul', {}, roots.map((r) => h('li', {}, h('code', {}, r)))) : h('p', { class: 'muted' }, 'None set here.'),
+      fileRoots.length ? h('p', { class: 'small muted' }, 'Set in the agent’s config file: ', fileRoots.join(', '), '.') : null,
+      h('div', { class: 'row' }, h('button', { disabled: fresh.remote_actions === false, onclick: async () => { if (await sourceRootsForm(fresh, roots)) { toast('Saved'); overlay.remove(); show(); } } }, 'Edit folders')),
+      h('div', { class: 'actions' },
+        h('button', { onclick: () => overlay.remove() }, 'Close'),
+        h('button', { class: 'primary', disabled: fresh.remote_actions !== true && fresh.remote_actions !== null ? true : false, onclick: async () => { if (await actionForm(fresh, managed, null)) { toast('Saved'); overlay.remove(); show(); } } }, 'Add action')));
+    return body;
+  };
+  const overlay = h('div', { class: 'overlay' }, h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', style: 'max-width:720px' }, h('h2', {}, `Actions, locations, sign-ins and folders on ${a.hostname}`), await draw()));
+  document.body.append(overlay);
+}
+
 // --- agents ---
 async function agents() {
   const d = (await api('GET', '/agents')).data;
@@ -259,7 +627,7 @@ async function agents() {
       { title: 'Last seen', render: (a) => fmtAgo(a.last_seen_at) },
       { title: 'Version', render: (a) => h('span', {}, a.agent_version ? `v${a.agent_version}` : '—', a.outdated ? h('span', { style: 'margin-left:6px' }, badge('warning', 'Update available')) : '') },
       { title: 'System', render: (a) => a.os_info ?? '—' },
-      { title: 'Actions', render: (a) => names(a.actions) },
+      { title: 'Actions', render: (a) => h('span', {}, names(a.actions), a.managed_actions && a.remote_actions !== false ? h('button', { class: 'link', style: 'margin-left:8px', onclick: () => editActions(a) }, 'Edit') : '') },
       { title: 'Locations', render: (a) => (a.locations ?? []).join(', ') || '—' },
     ], d.agents, { empty: 'No agents yet. Enroll one for a server below.' })),
     card(`Servers without an agent (${d.servers_without_agent.length})`, table([
@@ -297,7 +665,7 @@ async function enrollAgent(server) {
     h('p', {}, 'Run one of these on that server, as root or Administrator. It downloads the agent, checks it can reach BMS, installs it as a service that starts at boot, and starts it. The secret is shown only once. If you lose it, remove the agent and enroll again.'),
     codeBlock('Linux (needs Python 3 and systemd)', r.install.linux),
     codeBlock('Windows (elevated PowerShell, needs Python 3 installed for all users)', r.install.windows),
-    h('p', { class: 'small muted' }, `Replace the folder after each location key with where that location is on this server. Add --backup-script PATH to let BMS start your backup. Agent version ${r.agent_release.version ?? '?'}, SHA-256 ${(r.agent_release.sha256 ?? '').slice(0, 16)}…`),
+    h('p', { class: 'small muted' }, `Replace the folder after each location key with where that location is on this server. BMS can then run a backup once you set its command under Agents, Actions (or give --backup-script PATH to fix it in the config file). Agent version ${r.agent_release.version ?? '?'}, SHA-256 ${(r.agent_release.sha256 ?? '').slice(0, 16)}…`),
     h('details', {}, h('summary', {}, 'Or set it up by hand'), codeBlock('config.json', config)),
     h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => { overlay.remove(); show(); } }, 'I have copied it'))));
   document.body.append(overlay);
@@ -354,6 +722,7 @@ async function backups() {
     { title: '', render: (j) => h('span', { class: 'row' },
       isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await act(() => api('POST', `/backup-jobs/${j.id}/run`), 'Backup started. The agent picks it up within a minute.')) show(); } }, 'Run now'),
       canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); runTest(j); } }, 'Run test'),
+      canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); manualTestForm(j); } }, 'Test by hand'),
       isAdmin() && LOCATION_METHODS.includes(j.backup_method) && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobLocation(j); } }, 'Location'),
       isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobScope(j); } }, 'Scope'),
       isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); setStatus(j); } }, 'Update status'),
@@ -432,20 +801,369 @@ async function setStatus(j) {
   });
   if (done) { toast('Status updated'); show(); }
 }
+// --- tests: what each one does, and recurring schedules ---
+let testTypeCache = null;
+const testTypes = async () => (testTypeCache ??= (await api('GET', '/test-types')).data);
+const forgetTestTypes = () => { testTypeCache = null; };
+const testHelp = (types) => Object.fromEntries(types.map((t) => [t.type, t.automated ? `${t.summary} Runs: ${t.runs}` : `${t.summary} BMS cannot run this one: do it by hand. If queued here it is recorded as skipped.`]));
+const testOptions = (types) => types.map((t) => ({ value: t.type, label: `${t.title}${t.automated ? '' : ' (not automated yet)'}` }));
+
 async function runTest(j) {
+  const types = (await testTypes()).filter((t) => t.active);
+  if (!types.length) return toast('Every test is turned off for your company.', true);
   const done = await formModal({
     title: `Queue test for ${j.hostname}`, submitLabel: 'Queue test',
-    fields: [{ name: 'test_type', label: 'Test type', type: 'select', options: opts(TEST_TYPES) }],
+    fields: [{ name: 'test_type', label: 'Test type', type: 'select', options: testOptions(types), value: 'random_restore', help: testHelp(types) }],
     onSubmit: (v) => api('POST', `/backup-jobs/${j.id}/test`, { test_type: v.test_type }),
   });
   if (done) { toast('Test queued'); show(); }
 }
 
+// --- tests done by hand ---
+// For backups BMS cannot read itself (Microsoft 365, platform backups) and for any test that is not automated. A person follows a checklist,
+// attaches evidence (fingerprints, notes, files) and completes it as passed or failed. A pass needs every step ticked and the required
+// evidence attached, and fingerprints that differ can never pass.
+const MANUAL_STATE = { pending: ['Waiting', 'warning'], running: ['In progress', 'info'], success: ['Passed', 'success'], failed: ['Failed', 'failed'], skipped: ['Skipped', 'warning'], cancelled: ['Cancelled', 'warning'] };
+const manualBadge = (status) => badge(MANUAL_STATE[status]?.[1] ?? 'info', MANUAL_STATE[status]?.[0] ?? label(status));
+const HASH_ALGORITHMS = ['sha256', 'sha512', 'sha1', 'md5'];
+const FILE_ACCEPT = '.png,.jpg,.jpeg,.pdf,.txt,.csv,.json,.log';
+const fmtSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} bytes`);
+
+// --- the item to open, the record of it, and checking by a second person ---
+const isShot = (e) => e.kind === 'file' && /\.(png|jpe?g)$/i.test(e.file_name ?? '');
+const VERIFY_STATE = { pending: ['Awaiting a second check', 'warning'], confirmed: ['Checked and confirmed', 'success'], rejected: ['Rejected on review', 'failed'] };
+
+// What the tester has to open: chosen at random by BMS when the test was created.
+const selectionBox = (t) => t.selection && h('div', { class: 'refbox' },
+  h('strong', {}, 'Which item: '), t.selection.text,
+  h('div', { class: 'small muted', style: 'margin-top:4px' }, t.selection.fallback));
+
+// The tester records the item as fields. BMS checks they hold together before a pass is allowed.
+const findingsForm = (t, paint) => {
+  if (!t.fields?.length) return null;
+  const inputs = {};
+  const row = (f) => {
+    const id = `finding_${f.id}`;
+    const common = { id, disabled: !t.can_edit };
+    let input;
+    if (f.type === 'select') {
+      input = h('select', common, [h('option', { value: '' }, 'Choose…'), ...Object.entries(f.options).map(([v, text]) => h('option', { value: v }, text))]);
+      input.value = f.value ?? '';
+    } else {
+      input = h('input', { ...common, type: f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : f.type === 'time' ? 'time' : 'text', value: f.value ?? '' });
+    }
+    inputs[f.id] = input;
+    return h('div', { class: 'field' }, h('label', { for: id }, f.label, f.required ? ' *' : ''), input);
+  };
+  const form = h('form', { class: 'findings', onsubmit: async (e) => {
+    e.preventDefault();
+    const body = {};
+    for (const f of t.fields) body[f.id] = inputs[f.id].value === '' ? null : (f.type === 'number' ? Number(inputs[f.id].value) : inputs[f.id].value);
+    if (await act(() => api('PUT', `/manual-tests/${t.id}/findings`, body), 'Details saved')) paint();
+  } },
+    t.fields.map(row),
+    t.can_edit && h('button', { class: 'primary', type: 'submit' }, 'Save details'));
+  return h('div', {}, h('h3', {}, 'Details of the item'),
+    h('p', { class: 'small muted' }, 'Enter these from the backup console and the restored item. Times are in the tenant’s time zone. BMS checks they agree with each other and with the item you were asked to open, and the screenshots are the proof someone can look at.'),
+    form);
+};
+
+// A second person's decision on a test picked for checking.
+const verifyPanel = (t, paint) => {
+  const v = t.verification;
+  const state = v?.state && VERIFY_STATE[v.state];
+  return [
+    state && h('p', {}, h('strong', {}, 'Second check: '), badge(state[1], state[0]), v.verified_by ? ` by ${v.verified_by}` : '', v.note ? h('span', { class: 'muted' }, ` — ${v.note}`) : ''),
+    t.can_verify && h('div', { class: 'refbox' },
+      h('strong', {}, 'This test was picked for a second check. '),
+      'Look at the screenshots and the details above. Confirm if the screenshots show what the details say: the item, its date, subject and size, and a restore that completed. Reject if they do not, and say why. A rejection turns the pass into a failure.',
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'primary', onclick: async () => { if (await act(() => api('POST', `/manual-tests/${t.id}/verify`, { decision: 'confirm' }), 'Confirmed')) paint(); } }, 'Confirm the evidence'),
+        h('button', { class: 'danger', onclick: async () => {
+          const done = await formModal({ title: 'Reject the evidence', submitLabel: 'Reject and fail the test', fields: [{ name: 'note', label: 'What is wrong', type: 'textarea', required: true, hint: 'Shown to the admins and kept in the audit log.' }],
+            onSubmit: (x) => api('POST', `/manual-tests/${t.id}/verify`, { decision: 'reject', note: x.note.trim() }) });
+          if (done) { toast('Recorded as failed'); paint(); } } }, 'Reject'))),
+    isAdmin() && t.test_status === 'success' && !v?.state && h('p', {}, h('button', { class: 'link', onclick: async () => { if (await act(() => api('POST', `/manual-tests/${t.id}/request-verification`), 'Sent for a second check')) paint(); } }, 'Ask for a second check')),
+  ];
+};
+
+const verifyCard = (rows) => card(`Waiting for a second check (${rows.length})`,
+  h('p', { class: 'small muted' }, 'A share of passed tests done by hand, picked at random, is checked by a second person who looks at the screenshots and details. You cannot check your own.'),
+  table([
+    { title: 'Server', render: (x) => x.hostname },
+    { title: 'Test', render: (x) => label(x.test_type) },
+    { title: 'Sample', render: (x) => x.target ?? '—' },
+    { title: 'Done by', render: (x) => x.assigned_username ?? '—' },
+    { title: 'Completed', render: (x) => fmtAgo(x.completed_time) },
+    { title: '', render: (x) => h('button', { class: 'link', onclick: () => openManualTest(x.id) }, x.can_verify ? 'Review' : 'View') },
+  ], rows, { empty: 'Nothing is waiting to be checked.' }));
+
+async function manualTestForm(job) {
+  const types = (await testTypes()).filter((t) => t.active);
+  if (!types.length) return toast('Every test is turned off for your company.', true);
+  let created = null;
+  const done = await formModal({
+    title: `Test by hand: ${job.hostname}`, submitLabel: 'Create test',
+    fields: [
+      { name: 'test_type', label: 'Test', type: 'select', options: types.map((t) => ({ value: t.type, label: t.title })), value: job.backup_method === 'acronis_m365' || job.backup_method === 'microsoft_native_365' ? 'm365_mailbox' : 'random_restore',
+        help: Object.fromEntries(types.map((t) => [t.type, t.summary.replace(/^Not built: would /, 'You ')])) },
+      { name: 'target', label: 'What to sample (optional)', hint: 'A mailbox, site or folder. Leave it empty and BMS picks one from the tenant’s list, the one tested least recently.' },
+    ],
+    onSubmit: async (v) => { created = (await api('POST', `/backup-jobs/${job.id}/manual-test`, { test_type: v.test_type, target: v.target.trim() || null })).data; },
+  });
+  if (done && created) { toast('Test created'); show(); openManualTest(created.id); }
+}
+
+async function openManualTest(id) {
+  const overlay = h('div', { class: 'overlay' });
+  document.body.append(overlay);
+  const close = () => { overlay.remove(); show(); };
+  const paint = async () => {
+    let t;
+    try { t = (await api('GET', `/manual-tests/${id}`)).data; } catch (e) { overlay.remove(); return toast(errMessage(e), true); }
+    const box = overlay.firstElementChild;
+    const keep = box ? box.scrollTop : 0;
+    const modal = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', style: 'max-width:880px;max-height:90vh;overflow:auto' }, manualBody(t, paint, close));
+    overlay.replaceChildren(modal);
+    modal.scrollTop = keep;
+  };
+  await paint();
+}
+
+const evidenceView = (t, e, paint, step = null) => h('li', { style: 'margin:4px 0' },
+  e.kind === 'note' ? h('span', {}, h('strong', {}, `${e.label}: `), e.value_a)
+    : e.kind === 'hash' ? h('span', {}, h('strong', {}, `${e.label}: `), `${e.algorithm.toUpperCase()} `, h('code', { style: 'word-break:break-all' }, e.value_a),
+      e.value_b ? h('span', {}, step?.reference ? ' expected, restored ' : ' / ', h('code', { style: 'word-break:break-all' }, e.value_b), ' ', e.value_a === e.value_b ? badge('success', 'Match') : badge('failed', 'Differ')) : h('span', { class: 'muted' }, ' (no restored value yet)'))
+      : h('span', {}, h('strong', {}, `${e.label}: `), h('a', { href: `/api/manual-tests/${t.id}/evidence/${e.id}/file`, download: e.file_name }, e.file_name), ` (${fmtSize(e.file_size ?? 0)})`,
+        isShot(e) ? h('div', {}, h('a', { href: `/api/manual-tests/${t.id}/evidence/${e.id}/file?inline=1`, target: '_blank', rel: 'noopener' },
+          h('img', { src: `/api/manual-tests/${t.id}/evidence/${e.id}/file?inline=1`, alt: `Screenshot: ${e.label}`, style: 'max-width:280px;max-height:170px;border:1px solid var(--line);border-radius:4px;margin-top:4px' }))) : null),
+  t.can_edit && h('button', { class: 'link', style: 'margin-left:8px', onclick: async () => { if (await act(() => api('DELETE', `/manual-tests/${t.id}/evidence/${e.id}`), 'Removed')) paint(); } }, 'Remove'));
+
+async function addNoteEvidence(t, stepId, paint) {
+  const done = await formModal({
+    title: 'Add a note', submitLabel: 'Add',
+    fields: [{ name: 'label', label: 'Title', required: true, value: stepId ? '' : 'Note' }, { name: 'text', label: 'Note', type: 'textarea', required: true }],
+    onSubmit: (v) => api('POST', `/manual-tests/${t.id}/evidence`, { kind: 'note', step_id: stepId, label: v.label.trim(), text: v.text.trim() }),
+  });
+  if (done) paint();
+}
+
+async function addHashEvidence(t, stepId, paint) {
+  const done = await formModal({
+    title: 'Add fingerprints (hashes)', submitLabel: 'Add',
+    fields: [
+      { name: 'label', label: 'What was hashed', required: true, hint: 'The file or item, for example Q3-report.xlsx.' },
+      { name: 'algorithm', label: 'Algorithm', type: 'select', options: HASH_ALGORITHMS.map((a) => ({ value: a, label: a.toUpperCase() })), value: 'sha256' },
+      { name: 'original', label: 'Original', required: true, hint: 'Paste the hash exactly. Spaces and capitals are fine. It must be the right length for the algorithm.' },
+      { name: 'restored', label: 'Restored copy', hint: 'Leave empty if you have not hashed the restored copy yet. If both are given and they differ, the test cannot pass.' },
+    ],
+    onSubmit: (v) => api('POST', `/manual-tests/${t.id}/evidence`, { kind: 'hash', step_id: stepId, label: v.label.trim(), algorithm: v.algorithm, original: v.original, restored: v.restored.trim() || null }),
+  });
+  if (done) paint();
+}
+
+async function addRestoredFingerprint(t, stepId, paint) {
+  const done = await formModal({
+    title: 'Fingerprint of the restored copy', submitLabel: 'Compare and save',
+    fields: [{ name: 'restored', label: `${t.reference.algorithm.toUpperCase()} of the restored ${t.reference.label}`, required: true, hint: 'Paste it exactly. Spaces and capitals are fine. BMS compares it with the expected fingerprint shown on the test, and a different one means the test cannot pass.' }],
+    onSubmit: (v) => api('POST', `/manual-tests/${t.id}/evidence`, { kind: 'hash', step_id: stepId, label: t.reference.label, restored: v.restored.trim() }),
+  });
+  if (done) paint();
+}
+
+function attachFile(t, stepId, paint) {
+  const input = h('input', { type: 'file', accept: FILE_ACCEPT, style: 'display:none' });
+  input.onchange = async () => {
+    const f = input.files[0];
+    input.remove();
+    if (!f) return;
+    const fd = new FormData();
+    fd.append('file', f);
+    if (stepId) fd.append('step_id', stepId);
+    fd.append('label', f.name);
+    if (await act(() => api('POST', `/manual-tests/${t.id}/evidence-file`, fd), 'File attached')) paint();
+  };
+  document.body.append(input);
+  input.click();
+}
+
+async function completeFailed(t, paint) {
+  const done = await formModal({
+    title: 'Complete as failed', submitLabel: 'Record failure',
+    fields: [
+      { name: 'failure_type', label: 'What kind of failure', type: 'select', options: [['restore_failed', 'Restore failed'], ['file_missing', 'Item or recovery point missing'], ['hash_mismatch', 'Fingerprints differ'], ['corruption', 'Data damaged'], ['access_denied', 'Access denied'], ['timeout', 'Timed out']].map(([value, label]) => ({ value, label })), value: 'restore_failed' },
+      { name: 'severity', label: 'Severity', type: 'select', options: opts(['critical', 'high', 'medium', 'low']), value: 'high' },
+      { name: 'notes', label: 'What went wrong', type: 'textarea', required: true, hint: 'Shown to whoever reviews the failure, and kept in the audit log.' },
+    ],
+    onSubmit: (v) => api('POST', `/manual-tests/${t.id}/complete`, { result: 'failed', failure_type: v.failure_type, severity: v.severity, notes: v.notes.trim() }),
+  });
+  if (done) { toast('Failure recorded'); paint(); }
+}
+
+function manualBody(t, paint, close) {
+  const ro = !t.can_edit;
+  const setStep = async (stepId, done) => {
+    const list = t.steps.map((s) => ({ id: s.id, done: s.id === stepId ? done : s.done }));
+    if (await act(() => api('PUT', `/manual-tests/${t.id}`, { checklist: list }))) paint();
+  };
+  const ticked = t.steps.filter((s) => s.done).length;
+  return [
+    h('h2', {}, t.title, ' ', manualBadge(t.test_status)),
+    h('table', { class: 'kv' }, h('tbody', {},
+      h('tr', {}, h('th', {}, 'Server'), h('td', {}, `${t.hostname} (${label(t.backup_method)})`)),
+      h('tr', {}, h('th', {}, t.target_label), h('td', {}, t.target ? h('strong', {}, t.target) : h('span', { class: 'muted' }, 'Not set. Choose one yourself and note it below.'))),
+      h('tr', {}, h('th', {}, 'Being done by'), h('td', {}, t.assigned_username ?? 'Nobody yet')),
+      h('tr', {}, h('th', {}, 'Progress'), h('td', {}, `${ticked} of ${t.steps.length} steps ticked`)))),
+    t.reference && h('div', { class: 'refbox' }, h('strong', {}, 'Reference item: '), t.reference.label, t.reference.where ? ` (${t.reference.where})` : '',
+      h('div', { class: 'small' }, `Expected ${t.reference.algorithm.toUpperCase()}: `, h('code', { style: 'word-break:break-all;user-select:all' }, t.reference.hash)),
+      h('div', { class: 'small muted' }, 'Restore this item, work out the fingerprint of the restored copy and enter it below. You do not need the original or the mailbox owner.')),
+    t.test_type === 'm365_mailbox' && !t.reference && h('p', { class: 'small muted' }, 'This tenant has no reference item, so there is no original to compare with. Restore an item from the test mailbox and check it is complete and opens. Ask an admin to add reference items for a stronger check.'),
+    t.summary_help && h('p', { class: 'small muted', style: 'margin:10px 0' }, t.summary_help),
+    t.test_status === 'pending' && h('p', {}, 'This test has not been started. Start it to take it on and tick off the steps.'),
+    (t.result_summary || t.error_message) && h('p', {}, h('strong', {}, 'Result: '), t.result_summary ?? '', t.error_message ? h('span', {}, ' ', t.error_message) : ''),
+    selectionBox(t),
+    verifyPanel(t, paint),
+    h('h3', {}, 'Checklist'),
+    h('ol', { class: 'steplist' }, t.steps.map((s, i) => h('li', { class: s.done ? 'done' : '' },
+      h('label', { class: 'step-row' },
+        h('span', { class: 'step-n' }, `${i + 1}.`),
+        h('input', { type: 'checkbox', checked: s.done, disabled: ro, onchange: (e) => setStep(s.id, e.target.checked) }),
+        h('span', { class: 'step-text' }, s.text, s.files ? h('span', { class: s.screenshots_attached >= s.files ? 'small muted' : 'small', style: s.screenshots_attached >= s.files ? '' : 'color:var(--warn,#d98e00)' }, ` (screenshot needed: ${s.screenshots_attached} of ${s.files} attached)`) : '', s.required && s.evidence !== 'none' ? h('span', { class: 'small muted' }, s.evidence === 'hash' ? ' (fingerprints needed to pass)' : ' (note needed to pass)') : '')),
+      s.evidence_items.length ? h('ul', { class: 'step-evidence' }, s.evidence_items.map((e) => evidenceView(t, e, paint, s))) : null,
+      t.can_edit && h('div', { class: 'row step-controls' },
+        s.evidence === 'note' && h('button', { class: 'link', onclick: () => addNoteEvidence(t, s.id, paint) }, 'Add note'),
+        s.evidence === 'hash' && (s.reference
+          ? h('button', { class: 'link', onclick: () => addRestoredFingerprint(t, s.id, paint) }, s.evidence_items.length ? 'Replace restored fingerprint' : 'Enter restored fingerprint')
+          : h('button', { class: 'link', onclick: () => addHashEvidence(t, s.id, paint) }, 'Add fingerprints')),
+        h('button', { class: 'link', onclick: () => attachFile(t, s.id, paint) }, 'Attach file'))))),
+    findingsForm(t, paint),
+    h('h3', {}, 'Other notes and files'),
+    t.other_evidence.length ? h('ul', {}, t.other_evidence.map((e) => evidenceView(t, e, paint))) : h('p', { class: 'muted' }, 'None.'),
+    t.can_edit && h('div', { class: 'row' }, h('button', { class: 'link', onclick: () => addNoteEvidence(t, null, paint) }, 'Add note'), h('button', { class: 'link', onclick: () => addHashEvidence(t, null, paint) }, 'Add fingerprints'), h('button', { class: 'link', onclick: () => attachFile(t, null, paint) }, 'Attach file')),
+    h('div', { class: 'actions' },
+      (t.test_status === 'pending' || t.test_status === 'running') && h('button', { class: 'danger', onclick: async () => {
+        const done = await formModal({ title: 'Cancel this test', submitLabel: 'Cancel test', fields: [{ name: 'reason', label: 'Why', required: true }], onSubmit: (v) => api('POST', `/manual-tests/${t.id}/cancel`, { reason: v.reason.trim() }) });
+        if (done) { toast('Test cancelled'); paint(); } } }, 'Cancel test'),
+      h('button', { onclick: close }, 'Close'),
+      t.can_start && h('button', { class: t.test_status === 'pending' ? 'primary' : '', onclick: async () => { if (await act(() => api('POST', `/manual-tests/${t.id}/start`), t.test_status === 'pending' ? 'Started' : 'Taken over')) paint(); } }, t.test_status === 'pending' ? 'Start this test' : 'Take over'),
+      t.can_edit && h('button', { class: 'danger', onclick: () => completeFailed(t, paint) }, 'Complete as failed'),
+      t.can_edit && h('button', { class: 'primary', onclick: async () => {
+        if (await act(() => api('POST', `/manual-tests/${t.id}/complete`, { result: 'passed' }), 'Test recorded as passed')) paint();
+      } }, 'Complete as passed')),
+  ];
+}
+
+const manualCard = (rows) => card(`Tests to do by hand (${rows.length})`,
+  h('p', { class: 'small muted' }, 'For backups BMS cannot read itself, such as Microsoft 365 and platform backups, and for any test that is not automated. Open one to see what to sample and follow the checklist.'),
+  table([
+    { title: 'Server', render: (x) => x.hostname },
+    { title: 'Test', render: (x) => label(x.test_type) },
+    { title: 'Sample', render: (x) => x.target ?? h('span', { class: 'muted' }, 'Your choice') },
+    { title: 'Status', render: (x) => h('span', {}, manualBadge(x.test_status), x.assigned_username ? ` ${x.assigned_username}` : '') },
+    { title: 'Waiting', render: (x) => fmtAgo(x.scheduled_time) },
+    { title: '', render: (x) => h('button', { class: 'link', onclick: () => openManualTest(x.id) }, x.test_status === 'pending' && canRunTests() ? 'Open and start' : 'Open') },
+  ], rows, { empty: 'Nothing waiting. Create one from the Backups page (Test by hand) or schedule them.' }));
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const browserZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } };
+
+async function scheduleForm(existing) {
+  const types = (await testTypes()).filter((t) => t.active || t.type === existing?.test_type);
+  const [servers, jobs] = await Promise.all([api('GET', '/servers?limit=1000'), api('GET', '/backup-jobs?limit=1000')]);
+  const targets = [{ value: 'all', label: 'Every server (its newest backup BMS can test)' },
+    ...servers.data.filter((s) => s.active !== false).map((s) => ({ value: `server:${s.id}`, label: `Server: ${s.hostname}` })),
+    ...jobs.data.map((j) => ({ value: `job:${j.id}`, label: `Backup job: ${j.hostname} (${label(j.backup_method)}, #${j.id})` }))];
+  const current = existing ? (existing.target_type === 'all' ? 'all' : existing.target_type === 'server' ? `server:${existing.server_id}` : `job:${existing.backup_job_id}`) : 'all';
+  const done = await formModal({
+    title: existing ? `Edit schedule "${existing.name}"` : 'Schedule tests', submitLabel: 'Save',
+    fields: [
+      { name: 'name', label: 'Name', required: true, value: existing?.name ?? '', hint: 'For example Weekly restore check.' },
+      { name: 'who', label: 'Done by', type: 'select', options: [{ value: 'auto', label: 'BMS, automatically' }, { value: 'manual', label: 'A person, by hand (appears under Tests to do by hand)' }], value: existing?.manual ? 'manual' : 'auto',
+        hint: 'BMS can only run the tests marked Automated. Choose a person for the rest, for backups BMS cannot read such as Microsoft 365 and Acronis, or when you want a human to check.' },
+      { name: 'test_type', label: 'Test', type: 'select', options: types.map((t) => ({ value: t.type, label: t.automated ? t.title : `${t.title} (by hand only)` })), value: existing?.test_type ?? 'random_restore', help: Object.fromEntries(types.map((t) => [t.type, t.automated ? `${t.summary} Runs: ${t.runs}` : `${t.summary.replace(/^Not built: would /, 'A person ')}`])) },
+      { name: 'target', label: 'What to test', type: 'select', options: targets, value: current,
+        hint: 'A server or company-wide schedule tests each server’s newest successful backup. File tests (restore, write and read-back, full read-back, permissions) cover backups BMS can read: rsync, robocopy and manual copies. A recovery point check covers every method, each one checked separately, including Acronis.' },
+      { name: 'frequency', label: 'How often', type: 'select', options: [{ value: 'daily', label: 'Every day' }, { value: 'weekly', label: 'Every week' }, { value: 'monthly', label: 'Every month' }, { value: 'custom', label: 'Custom (cron)' }], value: existing?.frequency ?? 'weekly' },
+      { name: 'run_time', label: 'Time of day (24 hour, HH:MM)', value: existing?.run_time ?? '02:00', hint: 'Not used for a custom schedule.' },
+      { name: 'weekday', label: 'Day of the week (weekly only)', type: 'select', options: WEEKDAYS.map((d, i) => ({ value: String(i), label: d })), value: String(existing?.frequency === 'weekly' ? existing.run_day : 1) },
+      { name: 'monthday', label: 'Day of the month (monthly only, 1 to 28)', value: String(existing?.frequency === 'monthly' ? existing.run_day : 1) },
+      { name: 'cron', label: 'Cron expression (custom only)', value: existing?.frequency === 'custom' ? existing.cron : '', hint: 'Five fields, for example 0 2 * * 1-5 for 02:00 on weekdays. At most once an hour.' },
+      { name: 'timezone', label: 'Time zone', value: existing?.timezone ?? browserZone(), hint: 'The time of day above is in this zone, for example Africa/Johannesburg or UTC.' },
+    ],
+    onSubmit: async (v) => {
+      const [kind, id] = v.target.split(':');
+      const body = { name: v.name.trim(), test_type: v.test_type, manual: v.who === 'manual', target_type: kind, frequency: v.frequency, timezone: v.timezone.trim() };
+      if (kind === 'server') body.server_id = Number(id);
+      if (kind === 'job') body.backup_job_id = Number(id);
+      if (v.frequency === 'custom') body.cron = v.cron.trim();
+      else {
+        body.run_time = v.run_time.trim();
+        if (v.frequency === 'weekly') body.run_day = Number(v.weekday);
+        if (v.frequency === 'monthly') body.run_day = Number(v.monthday);
+      }
+      await (existing ? api('PUT', `/test-schedules/${existing.id}`, body) : api('POST', '/test-schedules', body));
+    },
+  });
+  if (done) { toast('Schedule saved'); show(); }
+}
+
+const scheduleCard = (rows) => card(`Test schedules (${rows.length})`,
+  h('p', { class: 'small muted' }, 'Recurring tests. Each one queues its tests at the set time and the engine runs them within a minute. If BMS was off at the time, the schedule runs once when it is back. Times are shown in your browser’s zone.'),
+  table([
+    { title: 'Name', render: (s) => s.name },
+    { title: 'Tests', render: (s) => s.target_name },
+    { title: 'Test', render: (s) => (s.manual ? h('span', {}, label(s.test_type), ' ', badge('info', 'By hand')) : label(s.test_type)) },
+    { title: 'Repeats', render: (s) => s.describe },
+    { title: 'Next run', render: (s) => (s.enabled ? fmtDate(s.next_run_at) : badge('warning', 'Paused')) },
+    { title: 'Last run', render: (s) => (s.last_run_at ? `${fmtAgo(s.last_run_at)}, ${s.last_queued} queued` : 'Never') },
+    { title: '', render: (s) => isAdmin() && h('span', { class: 'row' },
+      h('button', { class: 'link', onclick: async () => { if (await act(() => api('PUT', `/test-schedules/${s.id}`, { enabled: !s.enabled }), s.enabled ? 'Paused' : 'Resumed')) show(); } }, s.enabled ? 'Pause' : 'Resume'),
+      h('button', { class: 'link', onclick: () => scheduleForm(s) }, 'Edit'),
+      h('button', { class: 'link', onclick: async () => {
+        try { const r = await api('POST', `/test-schedules/${s.id}/run`); toast(r.data.queued ? `${r.data.queued} test${r.data.queued === 1 ? '' : 's'} queued` : 'Nothing to test right now: nothing is eligible, or a test is already queued.'); show(); } catch (e) { toast(errMessage(e), true); }
+      } }, 'Run now'),
+      h('button', { class: 'link', onclick: async () => { if (await confirmModal('Delete schedule?', `${s.name} will stop running. Tests already queued are not removed.`, 'Delete') && await act(() => api('DELETE', `/test-schedules/${s.id}`), 'Schedule deleted')) show(); } }, 'Delete')) },
+  ], rows, { empty: isAdmin() ? 'No schedules yet. Use Schedule tests to add one.' : 'No schedules yet.' }));
+
+// Which tests this company uses. The platform admin offers a subset; the company admin turns off any of those it has no use for.
+const settingsCard = (rows) => card('Tests this company uses',
+  h('p', { class: 'small muted' }, 'Turn off a test your company does not need, for example one for a backup solution you do not have. A test that is off cannot be created, scheduled or run, and anything waiting on it is cancelled or skipped. Tests marked Not offered are decided by your platform administrator.'),
+  table([
+    { title: 'Test', render: (x) => h('span', {}, h('strong', {}, x.title), x.automated ? '' : h('span', { class: 'muted' }, ' (by hand)')) },
+    { title: 'Status', render: (x) => (!x.available ? badge('failed', 'Not offered') : x.enabled ? badge('success', 'In use') : badge('warning', 'Turned off')) },
+    { title: '', render: (x) => (!x.available ? h('span', { class: 'small muted' }, 'Ask your platform administrator') : h('button', { class: 'link', onclick: async () => {
+      if (x.enabled && !await confirmModal(`Turn off ${x.title}?`, 'Open tests of this kind that people are doing by hand are cancelled, queued automatic ones are skipped, and its schedules stop queueing anything until it is turned back on. Results already recorded are kept.', 'Turn off')) return;
+      if (await act(() => api('PUT', '/test-settings', { tests: { [x.type]: !x.enabled } }), x.enabled ? 'Turned off' : 'Turned on')) { forgetTestTypes(); show(); }
+    } }, x.enabled ? 'Turn off' : 'Turn on')) },
+  ], rows, { empty: 'No tests.' }));
+
+async function companyTestsForm(c) {
+  const rows = (await api('GET', `/platform/companies/${c.id}/test-settings`)).data;
+  const done = await formModal({
+    title: `Tests offered to ${c.name}`, submitLabel: 'Save',
+    fields: [{ name: 'tests', label: 'Offered tests', type: 'checks', options: rows.map((r) => ({ value: r.type, label: `${r.title}${r.enabled ? '' : ' (the company has turned it off)'}` })), value: rows.filter((r) => r.available).map((r) => r.type),
+      hint: 'Untick a test to remove it from this company. Their admin cannot turn it back on, and open tests of that kind are cancelled or skipped. A test the company has turned off for itself stays off if you offer it again.' }],
+    onSubmit: (v) => api('PUT', `/platform/companies/${c.id}/test-settings`, { tests: Object.fromEntries(rows.map((r) => [r.type, v.tests.includes(r.type)])) }),
+  });
+  if (done) toast('Tests updated');
+}
+
+const testHelpCard = (types) => card('What each test does',
+  h('p', { class: 'small muted' }, 'Tests marked Automated run by themselves. The others a person does by hand: use Test by hand on the Backups page, or schedule them as done by a person. Any test can be done by hand. If one that BMS cannot run is queued for BMS, it is recorded as skipped and never counted as a pass.'),
+  types.map((t) => h('details', { style: 'margin:6px 0' },
+    h('summary', {}, h('strong', {}, t.title), ' ', t.automated ? badge('success', 'Automated') : badge('info', 'By hand only'), !t.available ? h('span', { style: 'margin-left:6px' }, badge('failed', 'Not offered to your company')) : !t.enabled ? h('span', { style: 'margin-left:6px' }, badge('warning', 'Turned off')) : '', h('span', { class: 'muted' }, ` ${t.summary}`)),
+    h('p', { class: 'small', style: 'margin:6px 0 6px 18px' }, t.details, h('br'), h('strong', {}, 'Runs: '), t.runs))));
+
+
 // --- tests and failures ---
 async function tests() {
-  const [t, f] = await Promise.all([api('GET', '/tests?limit=100'), api('GET', '/test-failures?resolved=false&limit=100')]);
+  const canSee = me.role !== 'company_technician';
+  const [t, f, types, sched, manual, verify, settings] = await Promise.all([api('GET', '/tests?limit=100'), api('GET', '/test-failures?resolved=false&limit=100'), testTypes(), canSee ? api('GET', '/test-schedules') : null, api('GET', '/manual-tests?status=open&limit=100'), api('GET', '/manual-tests?status=verify&limit=100'), isAdmin() ? api('GET', '/test-settings') : null]);
   const canResolve = me.role !== 'company_manager';
-  return h('div', {}, topbar('Tests'),
+  return h('div', {}, topbar('Tests', 'Restore tests prove a backup can be read back. Schedule them here, or queue one from the Backups page.', isAdmin() && h('button', { class: 'primary', onclick: () => scheduleForm(null) }, 'Schedule tests')),
+    manualCard(manual.data),
+    verify.data.length ? verifyCard(verify.data) : null,
+    sched && scheduleCard(sched.data),
     card(`Open failures (${f.pagination.total_count})`, table([
       { title: 'Server', render: (x) => x.hostname }, { title: 'Test', render: (x) => label(x.test_type) },
       { title: 'Type', render: (x) => label(x.failure_type) }, { title: 'Severity', render: (x) => badge(x.severity) },
@@ -453,14 +1171,30 @@ async function tests() {
       { title: '', render: (x) => canResolve && h('button', { class: 'link', onclick: () => resolveForm(x) }, 'Resolve') },
     ], f.data, { empty: 'No open failures.' })),
     card('Test history', table([
-      { title: 'Server', render: (x) => x.hostname }, { title: 'Type', render: (x) => label(x.test_type) }, { title: 'Status', render: (x) => badge(x.test_status === 'success' ? 'passed' : x.test_status, label(x.test_status)) },
+      { title: 'Server', render: (x) => x.hostname }, { title: 'Type', render: (x) => (x.manual ? h('span', {}, label(x.test_type), ' ', badge('info', 'By hand'), x.assigned_username ? ` ${x.assigned_username}` : '', x.verify_state ? h('span', { style: 'margin-left:6px' }, badge(VERIFY_STATE[x.verify_state][1], x.verify_state === 'pending' ? 'Awaiting check' : `${x.verify_state === 'confirmed' ? 'Checked' : 'Rejected'} by ${x.verified_username}`)) : '') : label(x.test_type)) }, { title: 'Status', render: (x) => badge(x.test_status === 'success' ? 'passed' : x.test_status, label(x.test_status)) },
       { title: 'Hash match', render: (x) => (x.hash_match == null ? '—' : x.hash_match ? 'Yes' : 'No') },
       { title: 'Compared with source', render: (x) => (x.source_status === 'verified' ? badge('success', 'Matches')
         : x.source_status === 'mismatch' ? badge('failed', 'Differs')
           : x.source_status === 'not_comparable' ? h('span', { class: 'muted', title: x.source_note ?? '' }, 'Not compared') : '—') }, { title: 'Duration', render: (x) => (x.duration_seconds != null ? `${x.duration_seconds}s` : '—') },
+      { title: 'Found', render: (x) => { const t = x.summary || (x.test_status === 'failed' || x.test_status === 'skipped' ? x.error_message : null); return t ? h('span', { class: x.test_status === 'success' ? '' : 'muted', title: t, style: 'display:inline-block;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom' }, t) : '—'; } },
       { title: 'Queued', render: (x) => fmtAgo(x.created_at) },
-    ], t.data, { empty: 'No tests have run yet.' })));
+      { title: 'Runs', render: (x) => (x.manual ? h('button', { class: 'link', onclick: () => openManualTest(x.id) }, ['pending', 'running'].includes(x.test_status) ? 'Open' : 'View evidence') : x.test_status === 'pending'
+        ? h('span', {}, x.retry_of ? h('span', { title: 'A failed test is retried after a delay' }, `Retry ${x.retry_count + 1}, `) : '', dueIn(x.scheduled_time),
+          canRunTests() && new Date(x.scheduled_time).getTime() - Date.now() > 90000 ? h('button', { class: 'link', style: 'margin-left:8px', onclick: async () => {
+            if (await act(() => api('POST', `/tests/${x.id}/run-now`), 'Queued to run now')) show();
+          } }, 'Run now') : '')
+        : '') },
+    ], t.data, { empty: 'No tests have run yet.' })),
+    settings ? settingsCard(settings.data) : null,
+    testHelpCard(types));
 }
+const dueIn = (v) => {
+  const sec = (new Date(v).getTime() - Date.now()) / 1000;
+  if (sec <= 90) return 'due now';
+  if (sec < 3600) return `in ${Math.round(sec / 60)} min`;
+  if (sec < 86400) return `in ${Math.round(sec / 360) / 10} h`;
+  return `in ${Math.round(sec / 8640) / 10} d`;
+};
 async function resolveForm(failure) {
   const done = await formModal({
     title: `Resolve failure on ${failure.hostname}`, submitLabel: 'Resolve',
@@ -594,7 +1328,8 @@ async function companies() {
       { title: 'Company', render: (c) => c.name }, { title: 'Slug', render: (c) => c.slug }, { title: 'Plan', render: (c) => label(c.subscription_tier) },
       { title: 'Users', render: (c) => c.users }, { title: 'Servers', render: (c) => `${c.servers}${c.max_servers ? ` / ${c.max_servers}` : ''}` },
       { title: 'Status', render: (c) => badge(c.is_active ? 'success' : 'failed', c.is_active ? 'Active' : 'Disabled') }, { title: 'Created', render: (c) => fmtDate(c.created_at) },
-      { title: '', render: (c) => (c.id === me.company.id ? h('span', { class: 'small muted' }, me.acting ? 'Open now' : 'Your company') : h('button', { class: 'link', onclick: () => enterCompany(c) }, 'Open')) },
+      { title: '', render: (c) => h('span', { class: 'row' }, h('button', { class: 'link', onclick: () => companyTestsForm(c) }, 'Tests'),
+        c.id === me.company.id ? h('span', { class: 'small muted' }, me.acting ? 'Open now' : 'Your company') : h('button', { class: 'link', onclick: () => enterCompany(c) }, 'Open')) },
     ], r.data)));
 }
 async function enterCompany(c) {
@@ -634,14 +1369,20 @@ async function companyForm() {
 // --- users (admin) ---
 async function users() {
   const r = await api('GET', '/users');
+  const name = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || '—';
   return h('div', {}, topbar('Users', `People in ${me.company.company_name}`, h('button', { class: 'primary', onclick: userForm }, 'Add user')),
     card(null, table([
-      { title: 'Username', render: (u) => u.username }, { title: 'Email', render: (u) => u.email }, { title: 'Role', render: (u) => ROLE_LABEL[u.role] },
+      { title: 'Username', render: (u) => h('span', {}, u.username, u.granted_access ? h('div', { class: 'small muted' }, 'Access granted by a platform admin') : '') },
+      { title: 'Name', render: (u) => name(u) }, { title: 'Email', render: (u) => u.email ?? '—' }, { title: 'Role', render: (u) => ROLE_LABEL[u.role] },
       { title: 'Status', render: (u) => badge(u.active ? 'success' : 'failed', u.active ? 'Active' : 'Disabled') }, { title: 'Last login', render: (u) => fmtAgo(u.last_login) },
-      { title: '', render: (u) => u.username === me.user.username ? h('span', { class: 'small muted' }, 'You') : h('span', { class: 'row' },
-        h('button', { class: 'link', onclick: () => roleForm(u) }, 'Change role'),
-        h('button', { class: 'link', onclick: () => resetPw(u) }, 'Reset password'),
-        h('button', { class: 'link', onclick: async () => { if (await act(() => api('PATCH', `/users/${u.id}`, { active: !u.active }), u.active ? 'User disabled' : 'User enabled')) show(); } }, u.active ? 'Disable' : 'Enable')) },
+      { title: 'Two-step', render: (u) => (u.mfa_enabled == null ? '\u2014' : u.mfa_enabled ? badge('success', 'On') : badge('warning', 'Not set up')) },
+      { title: '', render: (u) => (u.granted_access ? h('span', { class: 'small muted' }, 'Managed by a platform admin')
+        : u.username === me.user.username ? h('button', { class: 'link', onclick: () => editUser(u, true) }, 'Edit my details')
+          : h('span', { class: 'row' },
+            h('button', { class: 'link', onclick: () => editUser(u) }, 'Edit'),
+            h('button', { class: 'link', onclick: () => resetPw(u) }, 'Reset password'),
+            u.mfa_enabled && h('button', { class: 'link', onclick: () => resetMfa(`/users/${u.id}/mfa/reset`, u) }, 'Reset two-step'),
+            h('button', { class: 'link', onclick: async () => { if (await act(() => api('PATCH', `/users/${u.id}`, { active: !u.active }), u.active ? 'User disabled' : 'User enabled')) show(); } }, u.active ? 'Disable' : 'Enable'))) },
     ], r.data)));
 }
 async function userForm() {
@@ -649,21 +1390,31 @@ async function userForm() {
     title: 'Add user',
     fields: [
       { name: 'username', label: 'Username', required: true }, { name: 'email', label: 'Email', type: 'email', required: true },
-      { name: 'first_name', label: 'First name' }, { name: 'last_name', label: 'Last name' },
+      { name: 'first_name', label: 'First name' }, { name: 'last_name', label: 'Last name' }, { name: 'phone', label: 'Phone' },
       { name: 'role', label: 'Role', type: 'select', options: Object.entries(ROLE_LABEL).map(([value, l]) => ({ value, label: l })) },
       { name: 'password', label: 'Temporary password', type: 'password', required: true, hint: 'At least 12 characters. They can change it after logging in.' },
     ],
-    onSubmit: (v) => api('POST', '/users', { username: v.username.trim(), email: v.email.trim(), first_name: v.first_name.trim() || undefined, last_name: v.last_name.trim() || undefined, role: v.role, password: v.password }),
+    onSubmit: (v) => api('POST', '/users', { username: v.username.trim(), email: v.email.trim(), first_name: v.first_name.trim() || undefined, last_name: v.last_name.trim() || undefined, phone: v.phone.trim() || undefined, role: v.role, password: v.password }),
   });
   if (done) { toast('User created'); show(); }
 }
-async function roleForm(u) {
+// Edit a person's details. Your own role and status cannot be changed here, so an admin cannot lock their company out.
+async function editUser(u, self = false) {
+  const fields = [
+    { name: 'first_name', label: 'First name', value: u.first_name ?? '' }, { name: 'last_name', label: 'Last name', value: u.last_name ?? '' },
+    { name: 'email', label: 'Email', type: 'email', required: true, value: u.email ?? '' }, { name: 'phone', label: 'Phone', value: u.phone ?? '' },
+  ];
+  if (!self) fields.push({ name: 'role', label: 'Role', type: 'select', options: Object.entries(ROLE_LABEL).map(([value, l]) => ({ value, label: l })), value: u.role });
   const done = await formModal({
-    title: `Role for ${u.username}`,
-    fields: [{ name: 'role', label: 'Role', type: 'select', options: Object.entries(ROLE_LABEL).map(([value, l]) => ({ value, label: l })), value: u.role }],
-    onSubmit: (v) => api('PATCH', `/users/${u.id}`, { role: v.role }),
+    title: self ? 'Edit my details' : `Edit ${u.username}`, submitLabel: 'Save', fields,
+    onSubmit: (v) => api('PATCH', `/users/${u.id}`, { first_name: v.first_name.trim() || null, last_name: v.last_name.trim() || null, email: v.email.trim(), phone: v.phone.trim() || null, ...(self ? {} : { role: v.role }) }),
   });
-  if (done) { toast('Role updated'); show(); }
+  if (done) { toast('Saved'); show(); }
+}
+// Lost phone: remove their two-step sign-in and sign them out everywhere. They set it up again at their next sign-in.
+async function resetMfa(path, u) {
+  if (await confirmModal('Reset two-step sign-in?', `${u.username} will be signed out everywhere and must set up their authenticator app again at their next sign-in. Only do this once you are sure it is really them asking.`, 'Reset')
+    && await act(() => api('POST', path), 'Two-step sign-in reset')) show();
 }
 async function resetPw(u) {
   const done = await formModal({
@@ -672,6 +1423,44 @@ async function resetPw(u) {
     onSubmit: (v) => api('PATCH', `/users/${u.id}`, { password: v.password }),
   });
   if (done) toast('Password reset');
+}
+
+// --- people across companies (platform admins) ---
+async function people() {
+  const r = await api('GET', '/platform/users?limit=200');
+  const companyList = (await api('GET', '/platform/companies')).data;
+  return h('div', {}, topbar('People', 'Everyone on this system. Give a person access to other companies with a role for each, or make them a platform admin (access to every company as admin). Each change is recorded in the affected company’s audit log.'),
+    card(null, table([
+      { title: 'Username', render: (u) => h('span', {}, u.username, u.is_platform_admin ? h('span', { style: 'margin-left:6px' }, badge('info', 'Platform admin')) : '') },
+      { title: 'Name', render: (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || '—' },
+      { title: 'Home company', render: (u) => u.company.name }, { title: 'Role there', render: (u) => ROLE_LABEL[u.role] },
+      { title: 'Also has access to', render: (u) => (u.is_platform_admin ? 'Every company' : u.access.length ? u.access.map((a) => `${a.company} (${ROLE_LABEL[a.role]})`).join(', ') : '—') },
+      { title: 'Status', render: (u) => badge(u.active ? 'success' : 'failed', u.active ? 'Active' : 'Disabled') },
+      { title: 'Two-step', render: (u) => (u.mfa_enabled ? badge('success', 'On') : badge('warning', 'Not set up')) },
+      { title: '', render: (u) => h('span', { class: 'row' },
+        u.id !== me.id && u.mfa_enabled && h('button', { class: 'link', onclick: () => resetMfa(`/platform/users/${u.id}/mfa/reset`, u) }, 'Reset two-step'),
+        !u.is_platform_admin && h('button', { class: 'link', onclick: () => accessForm(u, companyList) }, 'Company access'),
+        u.id !== me.id && (u.is_platform_admin || (u.role === 'company_admin' && u.active)) && h('button', { class: 'link', onclick: () => togglePlatformAdmin(u) }, u.is_platform_admin ? 'Remove platform admin' : 'Make platform admin')) },
+    ], r.data)));
+}
+async function accessForm(u, companies) {
+  const others = companies.filter((c) => c.id !== u.company.id);
+  if (!others.length) return toast('There are no other companies to give access to.', true);
+  const current = Object.fromEntries(u.access.map((a) => [a.company_id, a.role]));
+  const roleOptions = [{ value: '', label: 'No access' }, ...Object.entries(ROLE_LABEL).map(([value, l]) => ({ value, label: l }))];
+  const done = await formModal({
+    title: `Company access for ${u.username}`, submitLabel: 'Save',
+    fields: others.map((c) => ({ name: `c${c.id}`, label: c.name, type: 'select', options: roleOptions, value: current[c.id] ?? '' })),
+    onSubmit: (v) => api('PUT', `/platform/users/${u.id}/access`, { grants: others.filter((c) => v[`c${c.id}`]).map((c) => ({ company_id: c.id, role: v[`c${c.id}`] })) }),
+  });
+  if (done) { toast('Access saved'); show(); }
+}
+async function togglePlatformAdmin(u) {
+  const making = !u.is_platform_admin;
+  const ok = await confirmModal(making ? 'Make platform admin?' : 'Remove platform admin?',
+    making ? `${u.username} will be able to work inside EVERY company as its admin, and create companies. Any per-company access they had is replaced by this.` : `${u.username} will lose access to other companies and can no longer create companies.`,
+    making ? 'Make platform admin' : 'Remove');
+  if (ok && await act(() => api('PATCH', `/platform/users/${u.id}/platform-admin`, { is_platform_admin: making }), making ? 'Now a platform admin' : 'Platform admin removed')) show();
 }
 
 // --- audit (admin) ---
@@ -689,7 +1478,13 @@ async function auditLog() {
 async function profile() {
   return h('div', {}, topbar('My profile'),
     card(null, h('table', {}, h('tbody', {}, ...[['Username', me.user.username], ['Email', me.user.email], ['Company', me.company.company_name], ['Role', ROLE_LABEL[me.role]]].map(([k, v]) => h('tr', {}, h('th', {}, k), h('td', {}, v))))),
-      h('div', { style: 'margin-top:14px' }, h('button', { onclick: changePw }, 'Change password'))));
+      h('div', { style: 'margin-top:14px' }, h('button', { onclick: changePw }, 'Change password'))),
+    card('Two-step sign-in', me.mfa?.enabled
+      ? h('div', {}, h('p', {}, badge('success', 'On'), ` Recovery codes left: ${me.mfa.recovery_codes_left}`, me.mfa.recovery_codes_left <= 2 ? ' \u2014 make new ones soon' : ''),
+        h('div', { class: 'row' }, h('button', { onclick: changeAuthenticator }, 'Change authenticator app'), h('button', { onclick: newRecoveryCodes }, 'New recovery codes'),
+          !me.mfa.required && h('button', { class: 'danger', onclick: turnOffMfa }, 'Turn off')),
+        me.mfa.required && h('p', { class: 'small muted' }, 'Two-step sign-in is required here, so it cannot be turned off.'))
+      : h('div', {}, h('p', {}, badge('failed', 'Off'), ' Add a second step to your sign-in.'), h('button', { class: 'primary', onclick: mfaSetupScreen }, 'Set up'))));
 }
 async function changePw() {
   const done = await formModal({
@@ -711,8 +1506,7 @@ async function notifications() {
 // --- boot: resume an existing session via the cookie ---
 (async () => {
   try {
-    const r = (await api('GET', '/me')).data;
-    me = { user: { username: r.username, email: r.email }, company: { id: r.company_id, company_name: r.company_name, company_slug: r.company_slug }, role: r.role, platform: r.platform_admin, acting: r.acting_in_other_company };
-    show();
-  } catch { loginScreen(); }
+    await loadMe();
+  } catch { loginScreen(); return; }
+  if (me.mfa?.setup_required) mfaSetupScreen(); else show();
 })();

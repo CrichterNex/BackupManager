@@ -11,6 +11,7 @@ use App\Services\Agents\AgentService;
 use App\Services\Audit;
 use App\Support\AgentRelease;
 use App\Support\ApiException;
+use App\Support\BackupPaths;
 use App\Support\Page;
 use App\Support\Scope;
 use Illuminate\Http\Request;
@@ -38,6 +39,9 @@ class ServerAgentController extends Controller
     public function enroll(Request $request, int $id)
     {
         $server = $this->server($request, $id);
+        if ($server->os_type === 'microsoft_365') {
+            throw ApiException::conflict('SERVER_005', 'A Microsoft 365 tenant is not a machine, so there is nothing to install an agent on. Its tests are done by a person from the Tests page.');
+        }
         [$agent, $secret] = DB::transaction(function () use ($server, $request) {
             $result = AgentService::enroll($server, $request->user()->id);
             Audit::log($request, 'agent_enrolled', 'server', $server->id, ['hostname' => $server->hostname]);
@@ -54,6 +58,154 @@ class ServerAgentController extends Controller
             'install' => AgentRelease::installCommands($request->getSchemeAndHttpHost(), $secret, BackupLocation::orderBy('name')->pluck('loc_key')->all()),
             'agent_release' => AgentRelease::summary(),
         ], 201);
+    }
+
+    /**
+     * Replace the backup commands BMS manages for this agent. Admin only, because whatever is saved here runs on the server
+     * with the agent's rights (root / SYSTEM), and every change is written to the audit trail.
+     */
+    public function updateActions(Request $request, int $id)
+    {
+        $body = $request->validate([
+            'actions' => ['present', 'array', 'max:20'],
+            'actions.*.command' => ['nullable', 'array', 'max:50'],
+            'actions.*.command.*' => ['string', 'max:1000'],
+            'actions.*.cwd' => ['sometimes', 'nullable', 'string', 'max:500'],
+            'actions.*.timeout_seconds' => ['sometimes', 'nullable', 'integer', 'min:60', 'max:604800'],
+        ]);
+        $clean = [];
+        foreach ($body['actions'] as $name => $a) {
+            if (! is_string($name) || ! preg_match('/^[A-Za-z0-9._-]{1,100}$/', $name)) {
+                throw ApiException::badRequest('Action names may only use letters, numbers, dot, dash and underscore.');
+            }
+            $cmd = array_values($a['command'] ?? []);
+            if ($cmd && trim($cmd[0]) === '') {
+                throw ApiException::badRequest("Action '$name': the first part of the command is the program to run and cannot be empty.");
+            }
+            $clean[$name] = ['type' => 'command', 'command' => $cmd ?: null]
+                + (! empty($a['cwd']) ? ['cwd' => $a['cwd']] : [])
+                + (! empty($a['timeout_seconds']) ? ['timeout_seconds' => (int) $a['timeout_seconds']] : []);
+        }
+        $server = $this->server($request, $id);
+        $agent = DB::transaction(function () use ($server, $clean, $request) {
+            $agent = Agent::where('server_id', $server->id)->lockForUpdate()->first() ?? throw ApiException::notFound('Agent', 'AGENT_005');
+            if ($agent->remote_actions === false) {
+                throw ApiException::conflict('AGENT_006', 'This agent was installed with remote actions turned off, so only its own config file decides what it runs.');
+            }
+            foreach (array_keys($clean) as $name) {
+                if (($agent->actions[$name]['type'] ?? null) === 'restore_test') {
+                    throw ApiException::badRequest("'$name' is a restore test action on this agent and cannot be replaced with a command.");
+                }
+            }
+            $before = $agent->managed_actions ?? [];
+            $agent->forceFill(['managed_actions' => $clean ?: null])->save();
+            Audit::log($request, 'agent_actions_updated', 'server', $server->id, ['hostname' => $server->hostname, 'before' => $before, 'after' => $clean]);
+
+            return $agent;
+        });
+
+        return response()->json(['success' => true, 'data' => $agent->summary() + ['managed_actions' => $agent->managedForAgent()]]);
+    }
+
+    /**
+     * Say which folder on this server each backup location key means. Admin only and audited. The agent still only ever uses
+     * these as a place to write backups to and read them from; a location that is not a BMS location cannot be set.
+     */
+    public function updateLocations(Request $request, int $id)
+    {
+        $body = $request->validate(['locations' => ['present', 'array', 'max:50'], 'locations.*' => ['required', 'string', 'max:512']]);
+        $known = BackupLocation::pluck('loc_key')->all();
+        $clean = [];
+        foreach ($body['locations'] as $key => $path) {
+            if (! is_string($key) || ! in_array($key, $known, true)) {
+                throw ApiException::badRequest('"'.$key.'" is not one of your backup locations. Add it on the Locations page first.');
+            }
+            $norm = str_replace('\\', '/', trim($path));
+            $absolute = str_starts_with($norm, '/') || preg_match('#^[A-Za-z]:(/|$)#', $norm);
+            if (! $absolute || str_contains($path, "\0") || in_array('..', explode('/', $norm), true)) {
+                throw ApiException::badRequest("The folder for \"$key\" must be a full path such as /mnt/nas/backups, D:\\Backups or \\\\nas\\share, with no \"..\".");
+            }
+            $clean[$key] = trim($path);
+        }
+        $server = $this->server($request, $id);
+        $agent = DB::transaction(function () use ($server, $clean, $request) {
+            $agent = Agent::where('server_id', $server->id)->lockForUpdate()->first() ?? throw ApiException::notFound('Agent', 'AGENT_005');
+            if ($agent->remote_actions === false) {
+                throw ApiException::conflict('AGENT_006', 'This agent was installed with remote actions turned off, so only its own config file decides what it runs.');
+            }
+            $before = $agent->managed_locations ?? [];
+            $agent->forceFill(['managed_locations' => $clean ?: null])->save();
+            Audit::log($request, 'agent_locations_updated', 'server', $server->id, ['hostname' => $server->hostname, 'before' => $before, 'after' => $clean]);
+
+            return $agent;
+        });
+
+        return response()->json(['success' => true, 'data' => $agent->summary() + ['managed_locations' => (object) ($agent->managed_locations ?? [])]]);
+    }
+
+    /**
+     * The folders this agent may read when it backs up a job's folders or compares a backup with its source. Admin only and audited.
+     * A folder here is a place the agent will read as root / SYSTEM, so only company admins can add one.
+     *
+     * @see BackupPaths::source() for what a valid folder is
+     */
+    public function updateSourceRoots(Request $request, int $id)
+    {
+        $body = $request->validate(['source_roots' => ['present', 'array', 'max:50'], 'source_roots.*' => ['required', 'string', 'max:512']]);
+        $clean = BackupPaths::sourceList($body['source_roots']);
+        $server = $this->server($request, $id);
+        $agent = DB::transaction(function () use ($server, $clean, $request) {
+            $agent = Agent::where('server_id', $server->id)->lockForUpdate()->first() ?? throw ApiException::notFound('Agent', 'AGENT_005');
+            if ($agent->remote_actions === false) {
+                throw ApiException::conflict('AGENT_006', 'This agent was installed with remote actions turned off, so only its own config file decides what it runs.');
+            }
+            $before = $agent->managed_source_roots ?? [];
+            $agent->forceFill(['managed_source_roots' => $clean ?: null])->save();
+            Audit::log($request, 'agent_source_roots_updated', 'server', $server->id, ['hostname' => $server->hostname, 'before' => $before, 'after' => $clean]);
+
+            return $agent;
+        });
+
+        return response()->json(['success' => true, 'data' => $agent->summary() + ['managed_source_roots' => array_values($agent->managed_source_roots ?? [])]]);
+    }
+
+    /**
+     * Set or remove the account an agent signs in with for one location's network share. Admin only and audited, but the audit
+     * entry holds the user name only. The password is stored encrypted, is never returned by any call, and is sent to the
+     * agent over HTTPS only when it changes.
+     */
+    public function updateCredentials(Request $request, int $id)
+    {
+        $body = $request->validate([
+            'location' => ['required', 'string', 'max:100'],
+            'remove' => ['sometimes', 'boolean'],
+            'username' => ['required_unless:remove,true', 'nullable', 'string', 'max:200'],
+            'password' => ['required_unless:remove,true', 'nullable', 'string', 'max:500'],
+        ]);
+        if (! BackupLocation::where('loc_key', $body['location'])->exists()) {
+            throw ApiException::badRequest('"'.$body['location'].'" is not one of your backup locations.');
+        }
+        $remove = (bool) ($body['remove'] ?? false);
+        $server = $this->server($request, $id);
+        $agent = DB::transaction(function () use ($server, $body, $remove, $request) {
+            $agent = Agent::where('server_id', $server->id)->lockForUpdate()->first() ?? throw ApiException::notFound('Agent', 'AGENT_005');
+            if ($agent->remote_actions === false) {
+                throw ApiException::conflict('AGENT_006', 'This agent was installed with remote actions turned off, so only its own config file decides what it runs.');
+            }
+            $all = $agent->managed_credentials ?? [];
+            if ($remove) {
+                unset($all[$body['location']]);
+            } else {
+                $all[$body['location']] = ['username' => trim($body['username']), 'password' => $body['password']];
+            }
+            $agent->forceFill(['managed_credentials' => $all ?: null, 'credentials_version' => $agent->credentials_version + 1])->save();
+            Audit::log($request, $remove ? 'agent_credentials_removed' : 'agent_credentials_set', 'server', $server->id,
+                ['hostname' => $server->hostname, 'location' => $body['location']] + ($remove ? [] : ['username' => trim($body['username'])]));
+
+            return $agent;
+        });
+
+        return response()->json(['success' => true, 'data' => $agent->summary() + ['credential_users' => (object) $agent->credentialUsers()]]);
     }
 
     public function destroy(Request $request, int $id)

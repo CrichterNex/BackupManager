@@ -76,3 +76,18 @@ input, select, textarea { font: inherit; width: 100%; padding: 8px 10px; border:
   .shell { grid-template-columns: minmax(0, 1fr); } .side { position: static; height: auto; flex-direction: row; flex-wrap: wrap; padding: 10px; }
   .brand { width: 100%; padding-bottom: 6px; } .side .spacer { display: none; } .main { padding: 14px; }
 }
+
+/* The checklist in a test done by hand: number, tick box and text on one line, evidence lined up under the text. The global input rule
+   (full width, padded) must not reach these tick boxes. */
+.steplist { list-style: none; margin: 0; padding: 0; }
+.steplist > li { margin: 0 0 14px; }
+.step-row { display: grid; grid-template-columns: 26px 22px 1fr; column-gap: 8px; align-items: start; margin: 0; color: var(--text); font-size: 14px; line-height: 1.45; cursor: pointer; }
+.step-row .step-n { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.step-row input[type="checkbox"] { width: 18px; height: 18px; padding: 0; margin: 1px 0 0; accent-color: var(--accent); cursor: pointer; }
+.step-row input[type="checkbox"]:disabled { cursor: default; }
+.steplist > li.done .step-text { color: var(--muted); }
+.step-evidence { list-style: none; margin: 6px 0 0 56px; padding: 0; font-size: 13px; }
+.step-controls { margin: 4px 0 0 56px; }
+.kv th { width: 30%; white-space: nowrap; }
+.modal h3 { margin: 20px 0 10px; font-size: 15px; }
+.refbox { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; background: rgba(127,127,127,.08); }

@@ -13,12 +13,18 @@ class BackupTestExecution extends Model
 
     protected $guarded = [];
 
-    protected $hidden = ['company_id', 'notes', 'details', 'updated_at'];
+    protected $hidden = ['company_id', 'notes', 'details', 'checklist', 'selection', 'findings', 'verify_note', 'updated_at'];
 
     protected function casts(): array
     {
         return [
             'hash_match' => 'boolean',
+            'manual' => 'boolean',
+            'checklist' => 'array',
+            'reference' => 'array',
+            'selection' => 'array',
+            'findings' => 'array',
+            'verified_at' => 'datetime',
             'duration_seconds' => 'integer',
             'retry_count' => 'integer',
             'details' => 'array',

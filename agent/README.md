@@ -13,9 +13,13 @@ your first install on each as a test, and use `--dry-run` first.
 ## How it stays safe
 
 - **Outbound only.** The agent calls BMS over HTTPS. Nothing listens on the server and no inbound port is opened.
-- **Named actions only.** BMS sends the *name* of an action (for example `backup`). What that name runs is set in
-  the agent's own config file. BMS cannot send a command line, so a compromised BMS or admin account can start the
-  actions you defined and nothing else.
+- **Named actions only.** BMS sends the *name* of an action (for example `backup`), never a command line. What a name
+  runs is set in the agent's config file, or, with remote actions on (the default), by an admin on the Agents page.
+- **Remote actions are a deliberate trade.** They let an admin change a backup command without touching the server, but
+  they also mean anyone who controls BMS or a company admin account can make that server run any command, as root or
+  SYSTEM. Only company admins can edit them, every change is in the audit log with before and after, and the agent
+  re-checks each entry (command type only, plain argument list, sane limits). If you want the config file to be the only
+  authority, install with `--no-remote-actions`. A `restore_test` action in the file can never be replaced from BMS.
 - **No shell.** Commands run as an argument list, so there is no shell injection.
 - **One secret per server**, shown once at enrolment and stored in BMS only as a hash. Removing the agent in BMS
   invalidates it at once.
@@ -57,13 +61,61 @@ What the install options mean:
 |---|---|
 | `--location KEY=PATH` | A backup location on this machine (repeatable). `KEY` is the key you gave the location in BMS. This lets restore tests run here. |
 | `--source-root PATH` | A folder on this machine whose files may be read to compare backups with their source (repeatable). Without any, the agent never reads source files. |
-| `--backup-script PATH` | The program BMS runs when it starts a backup here. Add arguments or more actions by editing the config afterwards. |
+| `--backup-script PATH` | Fixes the backup command in the config file. Not needed with remote actions: every agent starts with an empty `backup` action, and you set its command under Agents, Actions. |
+| `--no-remote-actions` | Do not let BMS define commands. Only the config file decides what runs. |
+| `--enable-remote-actions` | With `--upgrade`: turn remote actions on in an existing install (agents older than 1.3 do not have it). |
 | `--token-stdin` | Read the secret from standard input instead of the environment. |
 | `--service-user NAME` | Linux: run as this user instead of root, if your backup script allows it. |
 | `--dry-run` | Show what would happen, hide the secret, change nothing. **Use this first.** |
 | `--skip-check` | Install without first checking in to BMS (for example when this server cannot reach BMS yet). |
 
-You must give at least one of `--location` or `--backup-script`, because an agent with nothing it can do is useless.
+With `--no-remote-actions` you must give at least one of `--location` or `--backup-script`, because an agent with nothing it can do is useless.
+
+### Built-in robocopy and rsync (no folders in a script)
+For a job whose method is **robocopy** (Windows agent) or **rsync** (Linux agent), the agent builds the command itself from
+the job: its folders, exclusions, layout, location and destination folder. You set the folders once, on the job.
+- **Copy only.** Robocopy runs `/E /COPY:DAT /DCOPY:DAT /R:2 /W:5` and rsync runs `-a --partial`. Neither deletes at the
+  destination, so a wrong source folder cannot wipe good backups. The cost is that files deleted at the source stay in
+  the backup until you clean up, so it grows.
+- **Exclusions** become `/XD` and `/XF` for robocopy and anchored `--exclude` rules for rsync. Only those inside a source folder apply.
+- **Needs on the job:** specific folders (not whole server), a layout, and a location the agent knows (`--location`). A
+  job missing one is refused with what to fix. Robocopy cannot take a drive root such as `C:\`, so list folders on it.
+- **The location's own folder must already exist.** The agent creates the job's folders below it, never the location folder
+  itself, so a mistyped path cannot start a backup somewhere unintended. If it is missing or cannot be opened, the run
+  fails and says which, including the account the agent runs as.
+- **Network shares on Windows.** The agent runs as SYSTEM, which has no network login: a share sees it as this computer's
+  account (`DOMAIN\COMPUTERNAME$`). Give that account Modify rights on the share and folder, or run the BMS Agent task as
+  an account that already has access.
+- **Allowlists still apply.** Sources must be under the agent's `--source-root` folders, and the destination under its
+  location. BMS sends names and folders, never a command line; the program is always robocopy or rsync.
+- **Exit codes:** robocopy 0 to 7 is success. rsync 0 is success, and 24 (files vanished while running) is treated as success.
+- If a job has the built-in, it is used instead of the agent's `backup` command. Pick the command explicitly (the `action` option) to override it.
+- Agents older than 1.4 do not have it and keep running their `backup` command.
+
+### Changing a backup command without reinstalling
+The same dialog also holds **Locations on this server**: which folder each BMS backup location key means here, so you do
+not need `--location` at install time. Only existing BMS locations can be mapped, the path must be a full path, and a
+location set in the agent's config file wins over one set in BMS. Locations are only where backups are written and read,
+but a path you map is somewhere the agent will write as root or SYSTEM, so it is audited like an action.
+
+It also holds **Sign-in for network shares**: a user name and password the agent uses to open a location that is a Windows
+share, so you do not have to grant rights to the computer account. Read this before using it:
+- The password is encrypted in BMS (with `APP_KEY`), never shown or returned again, and kept out of the audit log (which
+  records who set it and for which location). It is sent to the agent over HTTPS only when it changes, and the agent keeps
+  it in memory only: never on disk, never in the log, never on a command line (it signs in through the operating system).
+- Anyone who controls BMS, or has the database and `APP_KEY`, can obtain it. Use a dedicated account that can read and write
+  the backup share and nothing else, not a domain admin.
+- Windows shares only. A Linux location is a mounted folder, so its login belongs in the mount (fstab or a credentials file).
+- Needs agent 1.7 or later, and is used for backups and restore tests on that location.
+
+It also holds **Folders it may read**: the allowlist a robocopy or rsync job's source folders must sit under (subfolders
+included), and the only place source comparison reads. This replaces `--source-root` at install time, is audited, and is
+added to any `source_roots` already in the config file. Needs agent 1.6 or later.
+On the Agents page, an admin clicks **Edit** next to an agent's actions. The program goes on the first line and each
+argument on its own line (no shell, so no quoting). The agent picks the change up on its next check-in, within about a
+minute. A command in the file is replaced by one of the same name set in BMS; the empty default never hides one. Do not
+put passwords in arguments, because they are stored in BMS and appear in the audit log. For an agent installed before
+1.3: run the new `bms_agent.py` with `--upgrade --enable-remote-actions` once.
 For a BMS on plain `http://` (local testing only) add `--allow-insecure-http`.
 
 **Update** an agent: download the new `bms_agent.py` onto the server and run `python bms_agent.py --upgrade`. It replaces
@@ -143,6 +195,19 @@ If you prefer not to use the installer:
    [Install]
    WantedBy=multi-user.target
    ```
+
+## Long-running backups
+- **Time limit.** Each action tells BMS how long it may run (a custom command's `timeout_seconds`, 8 hours for the built-in
+  robocopy and rsync, a restore test's own limit). BMS gives it that long **from when it starts**, plus 30 minutes, then
+  marks it failed. Older agents that do not say get 8 hours from the start.
+- **Results are not lost.** If BMS is unreachable when a command finishes, the agent keeps trying to deliver the result for
+  about half an hour. A refusal (for example the command has already expired) is final.
+- **A restart is noticed.** If the agent checks in idle while BMS thinks it is running something, BMS fails that command
+  straight away ("the agent restarted or lost this") instead of waiting for the deadline. A command that has just started
+  gets a minute of grace.
+- **Tests wait their turn.** An agent does one thing at a time. A test queued behind a long backup is held, not failed, for as
+  long as that backup is still within its own time. If nothing is ahead of it, a test the agent never picks up still expires.
+- **No progress meter.** BMS shows *running* until the result arrives, and only the last 4000 characters of output are kept.
 
 ## What you will see in BMS
 

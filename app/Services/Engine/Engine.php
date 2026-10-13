@@ -2,16 +2,21 @@
 
 namespace App\Services\Engine;
 
+use App\Models\BackupJob;
 use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
 use App\Models\Company;
 use App\Services\Agents\AgentService;
+use App\Services\CompanyTests;
 use App\Services\Integrations\IntegrationSync;
 use App\Services\Reports\ReportService;
 use App\Services\TestResults;
+use App\Services\TestScheduling;
 use App\Support\BackupPaths;
 use App\Support\CompanyContext;
 use App\Support\Constants;
+use Carbon\CarbonImmutable;
+use Cron\CronExpression;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -27,18 +32,21 @@ final class Engine
         $methods = Constants::FILESYSTEM_METHODS;
         $placeholders = implode(',', array_fill(0, count($methods), '?'));
         foreach (Company::where('is_active', true)->pluck('id') as $companyId) {
+            if (! CompanyTests::active('random_restore', $companyId)) {
+                continue; // the weekly automatic check is a random restore, which this company has turned off
+            }
             $queued += DB::affectingStatement(
                 "INSERT INTO backup_test_executions (company_id, backup_job_id, test_type, scheduled_time, created_at, updated_at)
                  SELECT ?, j.id, 'random_restore', ?, ?, ?
                    FROM backup_jobs j JOIN servers s ON s.id = j.server_id
                   WHERE j.company_id = ? AND j.deleted_at IS NULL AND s.active = 1 AND j.status = 'success'
                     AND j.backup_method IN ($placeholders)
-                    AND j.id = (SELECT MAX(id) FROM backup_jobs WHERE server_id = j.server_id AND deleted_at IS NULL AND status = 'success')
+                    AND j.id = (SELECT MAX(id) FROM backup_jobs WHERE server_id = j.server_id AND deleted_at IS NULL AND status = 'success' AND backup_method IN ($placeholders))
                     AND NOT EXISTS (
                       SELECT 1 FROM backup_test_executions t
-                       WHERE t.backup_job_id = j.id AND t.test_type = 'random_restore'
+                       WHERE t.backup_job_id = j.id AND t.test_type = 'random_restore' AND t.manual = 0
                          AND (t.test_status IN ('pending', 'running') OR t.created_at > ?))",
-                [$companyId, now(), now(), now(), $companyId, ...$methods, now()->subDays(config('bms.random_restore_every_days'))],
+                [$companyId, now(), now(), now(), $companyId, ...$methods, ...$methods, now()->subDays(config('bms.random_restore_every_days'))],
             );
         }
 
@@ -49,16 +57,16 @@ final class Engine
     private static function claimNext(): ?array
     {
         return DB::transaction(function () {
-            $t = BackupTestExecution::where('test_status', 'pending')->where('scheduled_time', '<=', now())
+            $t = BackupTestExecution::where('test_status', 'pending')->where('manual', false)->where('scheduled_time', '<=', now())
                 ->orderBy('scheduled_time')->orderBy('id')->lockForUpdate()->first();
             if (! $t) {
                 return null;
             }
             $t->forceFill(['test_status' => 'running', 'started_time' => now()])->save();
             $j = DB::table('backup_jobs as j')->join('servers as s', 's.id', '=', 'j.server_id')->leftJoin('backup_locations as bl', 'bl.id', '=', 'j.location_id')
-                ->where('j.id', $t->backup_job_id)->first(['j.server_id', 'j.backup_method', 's.hostname', 'bl.loc_key', 'bl.name as location_name', 'bl.path as location_path', 'j.destination_path', 'j.layout', 'j.source_paths', 'j.excluded_paths']);
+                ->where('j.id', $t->backup_job_id)->first(['j.server_id', 'j.backup_method', 's.hostname', 'bl.loc_key', 'bl.name as location_name', 'bl.path as location_path', 'j.destination_path', 'j.layout', 'j.source_paths', 'j.excluded_paths', 'j.schedule']);
 
-            return ['id' => $t->id, 'test_type' => $t->test_type, 'server_id' => $j->server_id, 'backup_method' => $j->backup_method, 'hostname' => $j->hostname, 'path' => $j->location_path, 'location_key' => $j->loc_key, 'location_name' => $j->location_name, 'destination' => $j->destination_path,
+            return ['id' => $t->id, 'test_type' => $t->test_type, 'job_id' => $t->backup_job_id, 'schedule' => $j->schedule, 'server_id' => $j->server_id, 'backup_method' => $j->backup_method, 'hostname' => $j->hostname, 'path' => $j->location_path, 'location_key' => $j->loc_key, 'location_name' => $j->location_name, 'destination' => $j->destination_path,
                 // What an agent on the source server needs to trace a backup file to its source file. Only when the job says how it is laid out.
                 'source' => $j->layout ? ['layout' => $j->layout, 'folders' => json_decode($j->source_paths ?? '[]', true) ?: [], 'excluded' => json_decode($j->excluded_paths ?? '[]', true) ?: []] : null];
         });
@@ -114,6 +122,49 @@ final class Engine
         return RandomRestoreRunner::run($root, config('bms.restore_staging_dir'));
     }
 
+    /**
+     * Is there a recent successful backup? Reads what BMS recorded for the job's server and method, so it works for platform backups too.
+     * The allowance is one and a half schedule intervals plus two hours when the job has a schedule, otherwise a fixed number of hours.
+     *
+     * @return array<string, mixed>
+     */
+    /** How old the newest recovery point may be: one and a half schedule intervals plus two hours, or a fixed number of hours with no schedule. */
+    public static function allowedAgeHours(?string $schedule): int
+    {
+        $allowed = (int) config('bms.recovery_point_max_age_hours');
+        if ($schedule) {
+            try {
+                $c = CronExpression::factory($schedule);
+                $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+                $interval = $c->getNextRunDate($now, 1)->getTimestamp() - $c->getNextRunDate($now, 0)->getTimestamp();
+                $allowed = (int) ceil($interval * 1.5 / 3600) + 2;
+            } catch (Throwable) {
+                // a bad expression was reported when the job was saved, so fall back to the fixed allowance
+            }
+        }
+
+        return $allowed;
+    }
+
+    private static function checkRecoveryPoint(array $t): array
+    {
+        $allowed = self::allowedAgeHours($t['schedule']);
+        $last = BackupJob::where('server_id', $t['server_id'])->where('backup_method', $t['backup_method'])->where('status', 'success')->max('completed_time');
+        if (! $last) {
+            return ['success' => false, 'failure_type' => 'file_missing', 'severity' => 'high', 'failed_item' => $t['hostname'], 'error_message' => 'No successful backup is recorded for this job, so there is no recovery point.',
+                'summary' => 'No successful backup recorded'];
+        }
+        $age = (int) floor(CarbonImmutable::parse($last, 'UTC')->diffInMinutes(now(), false) / 60);
+        $summary = "Latest recovery point: {$age} hours old (allowed {$allowed})";
+        if ($age > $allowed) {
+            return ['success' => false, 'failure_type' => 'file_missing', 'severity' => 'high', 'failed_item' => $t['hostname'],
+                'error_message' => "The latest successful backup is {$age} hours old, more than the {$allowed} hours allowed. Last success: ".CarbonImmutable::parse($last, 'UTC')->toDateTimeString().' UTC.',
+                'summary' => $summary, 'details' => ['age_hours' => $age, 'allowed_hours' => $allowed]];
+        }
+
+        return ['success' => true, 'summary' => $summary, 'details' => ['age_hours' => $age, 'allowed_hours' => $allowed]];
+    }
+
     /** Run every due test for one company. Returns how many were processed. */
     public static function runDueTests(int $companyId): int
     {
@@ -121,6 +172,25 @@ final class Engine
             $n = 0;
             while ($t = self::claimNext()) {
                 $n++;
+                // Turned off since it was queued: nothing runs, and the reason is recorded.
+                if (! CompanyTests::active($t['test_type'])) {
+                    TestResults::skip($t['id'], "The {$t['test_type']} test is turned off for this company.");
+
+                    continue;
+                }
+                // Only tests the engine really performs are run, on the agent or here. Anything else is recorded as skipped, never as a pass:
+                // handing it to the agent would run a random restore and report it as a test that never happened.
+                if (! in_array($t['test_type'], Constants::ENGINE_TEST_TYPES, true)) {
+                    TestResults::skip($t['id'], "The {$t['test_type']} test is not automated yet.");
+
+                    continue;
+                }
+                // Checks that read BMS's own records of the backup, so they work for every method, platform backups included.
+                if ($t['test_type'] === 'recovery_point') {
+                    TestResults::record($t['id'], self::checkRecoveryPoint($t));
+
+                    continue;
+                }
                 if ($reason = self::unsupportedReason($t)) {
                     TestResults::skip($t['id'], $reason);
 
@@ -132,6 +202,12 @@ final class Engine
                     if (! $queued) {
                         TestResults::skip($t['id'], $why);
                     }
+
+                    continue;
+                }
+                // Everything except a random restore reads or writes the backup location, which only the agent on the server is set up to do.
+                if ($t['test_type'] !== 'random_restore') {
+                    TestResults::skip($t['id'], "The {$t['test_type']} test runs on the server's agent, and this server has none. Enroll one on the Agents page.");
 
                     continue;
                 }
@@ -193,6 +269,7 @@ final class Engine
             $queued = self::scheduleDueTests();
             $ran = $escalated = $expired = $backups = $synced = 0;
             foreach (Company::where('is_active', true)->pluck('id') as $id) {
+                $queued += TestScheduling::runDue($id);
                 $ran += self::runDueTests($id);
                 $escalated += self::escalateFailures($id);
                 $expired += AgentService::expireStale($id);

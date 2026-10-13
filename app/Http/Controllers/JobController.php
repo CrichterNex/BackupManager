@@ -7,6 +7,7 @@ use App\Models\BackupLocation;
 use App\Models\BackupTestExecution;
 use App\Models\Server;
 use App\Services\Audit;
+use App\Services\CompanyTests;
 use App\Services\TestResults;
 use App\Support\ApiException;
 use App\Support\BackupPaths;
@@ -245,11 +246,12 @@ class JobController extends Controller
     {
         $data = $request->validate(['test_type' => ['sometimes', Rule::in(Constants::TEST_TYPES)]]);
         $type = $data['test_type'] ?? 'random_restore';
+        CompanyTests::assertActive($type);
         $test = DB::transaction(function () use ($id, $type, $request) {
             $query = BackupJob::query()->whereKey($id);
             Scope::technician($query, $request->user(), 'backup_jobs.server_id');
             $query->lockForUpdate()->first() ?? throw ApiException::notFound('Backup job', 'BACKUP_001');
-            if (BackupTestExecution::where('backup_job_id', $id)->where('test_type', $type)->whereIn('test_status', ['pending', 'running'])->exists()) {
+            if (BackupTestExecution::where('backup_job_id', $id)->where('test_type', $type)->where('manual', false)->whereIn('test_status', ['pending', 'running'])->exists()) {
                 throw ApiException::conflict('TEST_003', 'A test of this type is already queued or running for this job');
             }
             $t = BackupTestExecution::create(['backup_job_id' => $id, 'test_type' => $type, 'executed_by' => $request->user()->id]);

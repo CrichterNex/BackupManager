@@ -154,7 +154,7 @@ class AgentTest extends TestCase
         $this->poll();
         $this->admin->post("/api/backup-jobs/{$this->jobId}/run");
         $cmd = $this->poll()->json('command');
-        $this->assertEqualsCanonicalizing(['id', 'type', 'action', 'location', 'subpath', 'source', 'deadline_at'], array_keys($cmd));
+        $this->assertEqualsCanonicalizing(['id', 'type', 'test_type', 'action', 'location', 'subpath', 'source', 'deadline_at'], array_keys($cmd));
         $this->assertSame(400, $this->admin->post("/api/backup-jobs/{$this->jobId}/run", ['action' => 'rm -rf /'])->status());
     }
 
@@ -244,5 +244,21 @@ class AgentTest extends TestCase
         $this->assertCount(1, $this->admin->get('/api/agent-commands')->json('data'));
         $this->assertCount(1, $this->tech->get('/api/agent-commands')->json('data'));
         $this->assertCount(0, $this->other->get('/api/agent-commands')->json('data'));
+    }
+
+    public function test_a_test_type_the_engine_does_not_run_is_skipped_on_an_agent_server_and_never_handed_to_the_agent(): void
+    {
+        $this->poll();
+        foreach (['database_integrity', 'incremental_chain', 'm365_mailbox'] as $type) {
+            $this->assertSame(202, $this->admin->post("/api/backup-jobs/{$this->jobId}/test", ['test_type' => $type])->status());
+        }
+        Engine::runDueTests($this->companyId);
+        $this->assertSame(0, DB::table('agent_commands')->where('type', 'restore_test')->count(), 'no restore may be run for a test that is not automated');
+        $rows = DB::table('backup_test_executions')->whereIn('test_type', ['database_integrity', 'incremental_chain', 'm365_mailbox'])->get();
+        $this->assertCount(3, $rows);
+        foreach ($rows as $r) {
+            $this->assertSame('skipped', $r->test_status, $r->test_type);
+            $this->assertStringContainsString('not automated yet', (string) $r->error_message.(string) $r->notes.(string) $r->details);
+        }
     }
 }

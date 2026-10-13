@@ -2,6 +2,7 @@
 
 use App\Http\Middleware\AgentAuth;
 use App\Http\Middleware\CookieToken;
+use App\Http\Middleware\EnforceMfa;
 use App\Http\Middleware\RequestId;
 use App\Http\Middleware\RequirePermission;
 use App\Http\Middleware\RequirePlatformAdmin;
@@ -29,7 +30,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->redirectGuestsTo(fn () => null);
         $middleware->append([RequestId::class, SecurityHeaders::class]);
         $middleware->prependToGroup('api', CookieToken::class);
-        $middleware->alias(['permission' => RequirePermission::class, 'tenant' => ResolveTenant::class, 'platform' => RequirePlatformAdmin::class, 'agent' => AgentAuth::class]);
+        $middleware->alias(['permission' => RequirePermission::class, 'tenant' => ResolveTenant::class, 'platform' => RequirePlatformAdmin::class, 'agent' => AgentAuth::class, 'mfa' => EnforceMfa::class]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         // Expected, user-facing errors (validation, 403, 404, ...) are not faults, so they are not logged as errors.

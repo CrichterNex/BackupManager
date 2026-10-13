@@ -42,6 +42,9 @@ real data.
 - Roles: company admin, manager (read-only apart from reports), technician (assigned servers only)
 - Web UI: dashboard, servers, backups, tests and failure resolution, reports, users, audit log, notifications,
   and a Companies page for platform admins
+- Every page updates itself every 15 seconds, so statuses move without a reload. It waits while a dialog is open, a field
+  has been edited, a section is expanded, text is selected or the tab is hidden, and a small "Live · updated" note in the
+  corner shows it is working. Reads have their own allowance (7200 an hour, `BMS_READ_RATE_LIMIT_PER_HOUR`), separate from the 1000 an hour for changes, so open tabs never block someone from making a change.
 
 ## Platform admins
 
@@ -58,7 +61,24 @@ selected company admins two extra abilities from **Companies** in the UI (`/api/
   - The switch is a header (`X-Acting-Company`) the UI sends per browser tab. Anyone who is not a platform admin
     sending it gets 403, and an unknown company gets 404. It is never ignored.
 
-The flag is set by an operator, never through the API or UI:
+### Users, and access to other companies
+
+- **Editing people.** On **Users**, a company admin can edit a person's name, email, phone and role, reset their
+  password, and disable or enable them. Admins can edit their own details but not their own role or status, so a
+  company cannot lock itself out.
+- **Access to other companies.** On **People** (platform admins only), a platform admin can give any person access to
+  specific other companies, with a **role for each** (admin, manager or technician). The person keeps their home
+  company and signs in there. A **Company** picker in the sidebar switches them into a company they have access to,
+  and while inside they act with the granted role, not their home role, and nothing more. Other companies' admins see
+  them listed as "access granted by a platform admin" (name and role only) and can assign a granted technician to
+  servers, but cannot edit them. The role applies to one request at a time and is never written to the account.
+- **Auditing.** Granting, changing and removing access, and each time someone enters a company, are written to that
+  company's own audit log, and changes made through a grant are marked `via_access_grant`.
+- **Only platform admins grant access.** A company admin cannot give anyone access to another company. A disabled
+  company or user cannot be entered.
+- **Making a platform admin** (access to every company as admin) can also be done from **People**, for an active company
+  admin. You cannot change your own status, and giving someone the flag replaces any per-company access they had.
+  The operator command still works as the way to create the first one:
 
 ```bash
 php artisan bms:platform-admin alice            # grant
@@ -66,8 +86,9 @@ php artisan bms:platform-admin alice --revoke   # remove
 ```
 
 **Treat platform-admin accounts as the most sensitive in the system.** One compromised account can read and change
-every company's data. Keep the number small, use strong unique passwords, and review `platform_access_started`
-entries.
+every company's data, and can make more platform admins. Keep the number small, use strong unique passwords, and
+review `platform_access_started` and `platform_admin_granted` entries. An access grant is far narrower: one company,
+one role.
 
 ## How tenant isolation works
 
@@ -87,6 +108,115 @@ The audit trail is still write-once: database triggers reject UPDATE and DELETE.
 ## Test engine
 
 Runs every minute through the scheduler (`php artisan bms:engine` runs one pass by hand).
+
+**Nothing runs unless the engine does.** Queued and scheduled tests only happen while `php artisan schedule:work` (or the
+cron entry) is running. If a test sits at *pending*, that is the first thing to check.
+
+### Test schedules
+The Tests page has a **Test schedules** card where company admins set up recurring tests (managers can see them):
+- **What to test:** every server (each one's newest successful backup that BMS can read), one server, or one backup job.
+  Platform backups such as Acronis are not restore-tested by BMS, so they are left out.
+- **How often:** every day, week or month at a time of day in a time zone you choose (it defaults to your browser's), or a
+  custom cron expression. Nothing runs more often than hourly.
+- **Manage:** pause and resume, edit, **Run now** (queues the tests immediately and leaves the next run alone) and delete.
+  Every change is in the audit log. Tests a schedule queues are marked *Scheduled: <name>* and count as automated.
+- **Missed times:** if BMS or the engine was off at the scheduled time, the schedule runs once when it is back, not once per miss.
+- **No stacking:** a job that already has a test of that type pending or running is skipped.
+- **Skipping a wait:** a failed test is retried after a delay (`BMS_TEST_RETRY_DELAY_MINUTES`, 60 by default, three attempts), and
+  a scheduled test waits for its time. On the Tests page a waiting test shows when it runs, and **Run now** brings it forward
+  to the engine's next pass. It changes when the test runs, not how it counts: a retry is still the same attempt, and the
+  failure only shows under Open failures after the last attempt. It is audited, and follows the Run tests permission (admins
+  and technicians on their assigned servers).
+- **Alongside the weekly check:** the built-in check (each server's newest backup every `BMS_RANDOM_RESTORE_EVERY_DAYS`
+  days) still runs. It skips a job that already had a test queued inside that window, so a schedule more frequent than that
+  takes over, and one less frequent leaves the weekly check running between its runs.
+- Five tests are built and can be scheduled. The Tests page explains each one, says where it runs, and lists the three that are
+  not built (database integrity, incremental chain, Microsoft 365 mailbox), which are recorded as skipped, never as a pass.
+
+### The tests
+| Test | What it proves | Runs |
+|---|---|---|
+| Random file restore | One random file reads back and matches (and matches its source, when the job says how it is laid out). | Agent, or BMS when it can read the location |
+| Location write and read-back | The backup location is reachable, writable and returns data unchanged. It writes a 256 KB file in a hidden folder, reads it back and deletes it, and reports free space. It does not test your backup software. | Agent only |
+| Full read-back | Every file in the backup can be read from start to end. It restores nothing and does not show a server would boot. It reads all the data, so schedule it weekly or monthly. It has its own time limit (`full_read_timeout_seconds` on the restore-test action, 4 hours by default). | Agent only |
+| File permissions | Mode, owner and group (Linux) or the read-only, hidden and system flags (Windows) match on up to ten sampled files. Windows ACLs are not compared and the built-in robocopy does not copy them. Skipped, not passed, if the job has no layout or no sampled file has a source the agent may read. | Agent only |
+| Recovery point | A successful backup exists and is recent enough: one and a half schedule intervals plus two hours, or `BMS_RECOVERY_POINT_MAX_AGE_HOURS` (36) when the job has no schedule. Works for every method including Acronis, each method checked on its own. It does not check the data. | BMS, no agent |
+
+### Which tests a company uses
+Not every company has every backup solution, so tests can be limited per company, by two different people:
+- **The platform admin offers a subset.** On the Companies page, *Tests* lists the tests and which ones that company is offered.
+  A company cannot turn on a test it was not offered.
+- **The company admin turns off what it does not need.** On the Tests page, *Tests this company uses* lets a company admin turn
+  off any offered test, for example Microsoft 365 for a company with no Microsoft 365 backup, and turn it on again later.
+- A test is in use only when both are on. A company with no settings has every test, so nothing changes until someone changes it.
+  If the platform admin offers a test again, a test the company had turned off stays off.
+- **What happens when a test is off:** it cannot be queued, started by hand, or scheduled, and the forms stop offering it. Open
+  tests of that kind are cancelled (by hand) or skipped (automatic) with the reason. Its schedules stop queueing and carry on to
+  their next time, so turning the test back on resumes them. The weekly automatic check stops if *Random file restore* is off.
+  Results already recorded, and the help text, stay visible.
+- Every change is in the company's own audit trail, including one made by a platform admin, which is marked as such.
+
+### Microsoft 365 tenants
+A Microsoft 365 tenant is not a machine, so it is stored as a server of type **Microsoft 365 tenant**: no IP address, no agent, and
+only the Acronis Microsoft 365 or Microsoft native 365 backup methods. Its jobs, schedules, tests and reports work like any other.
+It carries a list of **mailboxes or sites to sample** (one per line). Each test by hand picks the one tested least recently.
+BMS does not yet read Microsoft 365 backup status from Acronis (the sync only reads machines), so the job's status is not updated
+automatically; the Recovery point check and tests by hand are what cover it today.
+
+### Testing a Microsoft 365 mailbox by hand
+The test is: restore an item chosen at random, and confirm it is complete and opens. Nobody reads a real person's mail and nobody
+asks the owner for an original.
+- **The item is chosen for the tester.** BMS picks the test mailbox, then a random weekday in the last 14 days
+  (`BMS_MANUAL_PICK_WINDOW_DAYS`) and a position (`BMS_MANUAL_PICK_MAX_POSITION`, up to 10): "Open the 3rd email received on
+  Wednesday 7 October in the Inbox, counting from the earliest that day." The tester cannot pick an easy one. If that day has
+  fewer emails, they take the last one that day, or the nearest earlier weekday that has mail, and say so.
+- **The tester records the item as fields**, not free text: the newest recovery point's date and time, the item's date, time, subject
+  and size, which email that day it was, and whether any attachment opens. Dates and times are read in the **time zone of the
+  backup console**, which is set on the tenant.
+- **BMS checks the record holds together** before a pass is allowed: every field is filled in; the item is not dated after its
+  recovery point; the recovery point is not in the future and is recent (the same allowance as the Recovery point test); the
+  attachment opens; and the item is the one asked for, or an earlier one with the reason given. A made-up record has to be consistent
+  to get through, which is harder than a made-up note.
+- **Screenshots are the proof.** The steps that restore and open the item each need a screenshot (PNG or JPEG), and the test
+  cannot pass without them. BMS does not read the screenshots; a person does, which is what the second check is for.
+- **Reference items are optional.** A tenant that keeps known files with recorded fingerprints (`name | fingerprint | where` on
+  the tenant) gets one extra step: restore that file and enter the restored copy's fingerprint, which BMS compares with the one it
+  holds. A different one can never pass. It is a stronger check on top, not the main one. BMS trusts the fingerprint an admin
+  recorded.
+
+### Checking by a second person
+A share of passed tests done by hand, picked at random, is checked by someone else (`BMS_MANUAL_VERIFY_PERCENT`, 20 by default).
+- Nobody knows which when they do the test. The admins are notified, and the test appears under *Waiting for a second check* on the
+  Tests page, where a different technician (or admin) opens it, sees the details and the screenshots, and **confirms** or
+  **rejects** it. You cannot check your own test.
+- A **rejection needs a reason and turns the pass into a failure** everywhere: server health, a failure record, a notification and the
+  audit log, exactly as if the test had failed. The original result stays visible, marked as rejected on review.
+- Until it is checked, the pass counts. An admin can also send any passed test for checking by hand.
+- Failures are not sampled, because a failure already raises an alert and gets reviewed.
+- Screenshots can be viewed in the page, but only real PNG or JPEG files, confirmed by their content. Everything else is a download.
+- **What this cannot do:** it cannot stop two technicians who agree to cheat, or prove an item exists in a mailbox BMS cannot see.
+  It makes a lazy or careless pass harder and puts a second pair of eyes on a sample.
+
+### Tests done by hand
+Any test can be done by a person, and for Microsoft 365 and platform backups it is the only way BMS has to test them.
+- **Create one:** *Test by hand* on a job (Backups page), or schedule tests as **done by a person** (the schedule's *Done by*
+  field). A schedule creates them at the set time, for every method, with the sample item already chosen.
+- **Do it:** open it under **Tests to do by hand** on the Tests page. The tester sees the sample item (the mailbox), starts the test
+  (it is then theirs; an admin can take it over), follows the checklist for that test type, and attaches evidence to each step:
+  a note, the SHA-256 (or SHA-1, SHA-512, MD5) of the original and the restored copy, and screenshots or documents.
+- **Evidence rules:** a fingerprint must be real hex of the right length (capitals and spaces are tidied) so a typo cannot pass
+  for a match. If an original and restored fingerprint are both given and differ, the test **cannot** be passed. Files are PNG,
+  JPG, PDF, TXT, CSV, JSON or LOG up to 5 MB, 20 per test, checked by content as well as name, stored privately under random names
+  and only ever downloaded (never shown in the page).
+- **Finishing:** *Complete as passed* needs every step ticked and the evidence the checklist marks as required. *Complete as
+  failed* needs notes and records a failure, an alert and an entry in Open failures like any other. Both go through the same path
+  as automated results, so server health, reports and the audit log treat them the same. A manual failure is not retried quietly,
+  because a person already judged it. Everything the tester does is in the audit log.
+- **Who:** admins and technicians on their assigned servers do tests. Managers can read them and download the evidence.
+  The engine never picks up a manual test, and a manual test does not stop the weekly automatic one.
+
+An agent only runs a test it says it can (agents older than 1.9 can only do a random restore), so an older agent is never
+asked for a test it would quietly turn into a random restore. A server with no agent has these tests skipped with that reason.
 
 - **Random file restore** for jobs that use a **backup location** (see below). It picks a random file in the
   job's location, copies it to a staging folder, compares SHA-256 of both, and removes the copy. Queued weekly per
@@ -171,8 +301,11 @@ still have none. Updating is `--upgrade` and removing is `--uninstall`. From the
 - **Run now** on the Backups page starts a backup through the agent, and cron schedules on jobs are started
   automatically while the agent is online.
 - Restore tests for that server run on the agent, so they work for backups BMS cannot read itself.
-- The agent only calls BMS (outbound HTTPS) and only runs actions named in its own local config. BMS sends a name,
-  never a command line. See `agent/README.md` for set-up and what it does and does not prove.
+- The agent only calls BMS (outbound HTTPS). BMS sends the name of an action, never a command line. Every agent starts
+  with an empty `backup` action and company admins set or change its command on the Agents page without reinstalling.
+  That means control of BMS (or a company admin account) is control of what runs on those servers, as root or SYSTEM, so
+  changes are audited and an agent can be installed with `--no-remote-actions` to keep its config file as the only
+  authority. See `agent/README.md` for set-up and what it does and does not prove.
 - Only admins can enroll agents and start backups. Technicians can still queue tests on their assigned servers.
 
 ## External backup platforms (Acronis)
@@ -217,6 +350,16 @@ device from the server's page (**Link to platform device**, picked from the plat
 
 Other platforms (Veeam, Commvault, Microsoft 365, AWS, Azure) are not built. Each would be another adapter behind the
 same connection and link model.
+
+## Two-step sign-in (MFA)
+
+Everyone must sign in with a password and a 6-digit code from an authenticator app (Microsoft Authenticator, Google Authenticator, Authy and similar). It is on by default. Set `BMS_MFA_REQUIRED=false` in `.env` to make it optional, in which case people can still turn it on for themselves from their profile.
+
+- **First sign-in.** Someone who has not set it up yet can sign in, but the app and the API stay locked until they scan the QR code, enter a code to prove it works, and save their ten recovery codes. This applies to sessions that were already open when you switched it on.
+- **Lost phone.** Each recovery code works once. If those are gone too, a company admin can reset the person's two-step sign-in from the Users page (a platform admin does the same for platform admins and from the People page). The reset signs them out everywhere and they set it up again at their next sign-in. From the server: `php artisan bms:mfa-reset <username>`.
+- **How it is protected.** Secrets are encrypted with `APP_KEY`. Recovery codes are stored as keyed hashes, so nobody can read them back. A code can only be used once, a wrong guess is limited per sign-in attempt, per person and per address, and the pending sign-in expires after five minutes.
+- **Scripts.** A login call now returns `mfa_required` and an `mfa_token`, and no session. Finish with `POST /api/auth/mfa/verify` and either `code` or `recovery_code`. Anything that logs in with a bare username and password will stop working, so give automation its own plan before you switch this on.
+- **Limit.** This is a code that can be phished like any other; it stops password reuse and guessing, not a convincing fake login page.
 
 ## Reports
 

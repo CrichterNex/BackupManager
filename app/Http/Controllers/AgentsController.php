@@ -6,6 +6,7 @@ use App\Models\Agent;
 use App\Models\AgentCommand;
 use App\Models\Server;
 use App\Support\AgentRelease;
+use App\Support\Permissions;
 use App\Support\Scope;
 use Illuminate\Http\Request;
 
@@ -23,15 +24,19 @@ class AgentsController extends Controller
         $busy = AgentCommand::whereIn('status', ['pending', 'running'])->whereIn('agent_id', $agents->pluck('id'))
             ->selectRaw('agent_id, SUM(status = \'pending\') AS pending, SUM(status = \'running\') AS running')->groupBy('agent_id')->get()->keyBy('agent_id');
 
+        $canManage = Permissions::can($me->effectiveRole(), 'agents:manage');
         $rows = $agents->map(fn (Agent $a) => [
             'id' => $a->id, 'server_id' => $a->server_id, 'hostname' => $a->hostname, 'server_os' => $a->os_type,
             ...$a->summary(),
+            // The commands may carry arguments not everyone should see, so only people who can change them get them.
+            ...($canManage ? ['managed_actions' => $a->managedForAgent(), 'managed_locations' => (object) ($a->managed_locations ?? []), 'managed_source_roots' => array_values($a->managed_source_roots ?? []), 'credential_users' => (object) $a->credentialUsers()] : []),
             'outdated' => AgentRelease::isOutdated($a->agent_version),
             'pending_commands' => (int) ($busy[$a->id]->pending ?? 0),
             'running_commands' => (int) ($busy[$a->id]->running ?? 0),
         ])->values();
 
-        $without = Server::where('active', true)->whereNotIn('id', Agent::query()->pluck('server_id'));
+        // A Microsoft 365 tenant is not a machine, so there is nothing to install an agent on.
+        $without = Server::where('active', true)->where('os_type', '<>', 'microsoft_365')->whereNotIn('id', Agent::query()->pluck('server_id'));
         Scope::technician($without, $me, 'servers.id');
 
         return response()->json(['success' => true, 'data' => [

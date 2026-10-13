@@ -20,7 +20,9 @@ class TestController extends Controller
         return BackupTestExecution::query()
             ->join('backup_jobs as j', 'j.id', '=', 'backup_test_executions.backup_job_id')
             ->join('servers as s', 's.id', '=', 'j.server_id')
-            ->select('backup_test_executions.*', 's.hostname');
+            ->leftJoin('users as au', 'au.id', '=', 'backup_test_executions.assigned_to')
+            ->leftJoin('users as vb', 'vb.id', '=', 'backup_test_executions.verified_by')
+            ->select('backup_test_executions.*', 's.hostname', 'au.username as assigned_username', 'vb.username as verified_username');
     }
 
     public function index(Request $request)
@@ -51,6 +53,31 @@ class TestController extends Controller
         $test = $query->first() ?? throw ApiException::notFound('Test', 'TEST_001');
 
         return response()->json(['success' => true, 'data' => [...$test->toArray(), 'failures' => BackupTestFailure::where('test_execution_id', $test->id)->orderBy('id')->get()]]);
+    }
+
+    /**
+     * Bring a waiting test forward so the engine takes it on its next pass. This is how someone skips the wait before a retry
+     * (a failed test is retried after a delay) or a scheduled time. It changes when the test runs, not how it counts: a retry is
+     * still the same attempt number.
+     */
+    public function runNow(Request $request, int $id)
+    {
+        $test = DB::transaction(function () use ($request, $id) {
+            $query = $this->executions()->where('backup_test_executions.id', $id);
+            Scope::technician($query, $request->user(), 'j.server_id');
+            $found = $query->first() ?? throw ApiException::notFound('Test', 'TEST_001');
+            $t = BackupTestExecution::lockForUpdate()->find($found->id);
+            if ($t->test_status !== 'pending') {
+                throw ApiException::conflict('TEST_004', 'Only a test that is waiting can be run now. This one is '.$t->test_status.'.');
+            }
+            $was = $t->scheduled_time;
+            $t->forceFill(['scheduled_time' => now()])->save();
+            Audit::log($request, 'test_run_now', 'test', $t->id, ['was_due' => $was?->toIso8601String(), 'attempt' => $t->retry_count + 1]);
+
+            return $t->refresh();
+        });
+
+        return response()->json(['success' => true, 'data' => $test], 202);
     }
 
     private function failures()
