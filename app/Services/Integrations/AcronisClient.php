@@ -174,6 +174,25 @@ final class AcronisClient
         return count($this->listMachines());
     }
 
+    /** The only read endpoints the probe may look at. Anything else is refused, so the probe cannot be used to explore the API freely. */
+    private const PROBE_PATHS = [
+        '/resource_management/v4/resource_statuses', '/task_manager/v2/activities', '/alert_manager/v1/alerts', '/policy_management/v4/policies',
+    ];
+
+    /**
+     * A read-only look at one of a few Acronis endpoints, for the probe command only. Never stored.
+     *
+     * @param  array<string, scalar>  $query
+     */
+    public function probeGet(string $path, array $query = []): array
+    {
+        if (! in_array($path, self::PROBE_PATHS, true)) {
+            throw new IntegrationException('The probe may only read: '.implode(', ', self::PROBE_PATHS));
+        }
+
+        return $this->get($path, $query);
+    }
+
     /** Raw first page, for the probe command only. Never stored. */
     public function rawFirstPage(): array
     {

@@ -5,6 +5,13 @@ const METHODS = ['rsync', 'robocopy', 'windows_manual_copy', 'linux_manual_copy'
 const LOCATION_METHODS = ['rsync', 'robocopy', 'windows_manual_copy', 'linux_manual_copy', 'manual_copy'];
 const LOCATION_KINDS = ['local_disk', 'network_share', 'nas', 'external_drive', 'offsite', 'other'];
 const opts = (list) => list.map((v) => ({ value: v, label: label(v) }));
+// The kind of backup, as people call it. Shown next to a server wherever tests are listed, because one server can have several.
+const METHOD_NAMES = {
+  rsync: 'Rsync', robocopy: 'Robocopy', windows_manual_copy: 'Windows manual copy', linux_manual_copy: 'Linux manual copy', manual_copy: 'Manual copy',
+  acronis: 'Acronis', acronis_m365: 'Acronis Microsoft 365', microsoft_native_365: 'Microsoft 365 (native)', veeam: 'Veeam', commvault: 'Commvault', aws_backup: 'AWS Backup', azure_backup: 'Azure Backup',
+};
+const methodName = (m) => METHOD_NAMES[m] ?? label(m);
+const serverCell = (x) => h('span', {}, x.hostname, x.backup_method ? h('span', { class: 'small muted' }, ` \u00b7 ${methodName(x.backup_method)}`) : '');
 const ROLE_LABEL = { company_admin: 'Admin', company_manager: 'Manager', company_technician: 'Technician' };
 
 let me = null; // { user, company, role }
@@ -12,20 +19,23 @@ const isAdmin = () => me.role === 'company_admin';
 const canRunTests = () => me.role !== 'company_manager';
 
 const PAGES = [
-  { id: 'dashboard', title: 'Dashboard', render: dashboard },
-  { id: 'servers', title: 'Servers', render: servers },
-  { id: 'agents', title: 'Agents', render: agents },
-  { id: 'backups', title: 'Backups', render: backups },
-  { id: 'locations', title: 'Locations', render: locations },
-  { id: 'tests', title: 'Tests', render: tests },
-  { id: 'reports', title: 'Reports', render: reports, noTechnician: true },
-  { id: 'users', title: 'Users', render: users, admin: true },
-  { id: 'integrations', title: 'Integrations', render: integrations, admin: true },
-  { id: 'companies', title: 'Companies', render: companies, platform: true },
-  { id: 'people', title: 'People', render: people, platform: true },
-  { id: 'audit', title: 'Audit log', render: auditLog, admin: true },
-  { id: 'profile', title: 'My profile', render: profile },
+  { id: 'dashboard', group: 'top', title: 'Dashboard', render: dashboard },
+  { id: 'servers', group: 'infrastructure', title: 'Servers', render: servers },
+  { id: 'agents', group: 'infrastructure', title: 'Agents', render: agents },
+  { id: 'backups', group: 'protection', title: 'Backups', render: backups },
+  { id: 'locations', group: 'infrastructure', title: 'Locations', render: locations },
+  { id: 'tests', group: 'protection', title: 'Tests', render: tests },
+  { id: 'reports', group: 'protection', title: 'Reports', render: reports, noTechnician: true },
+  { id: 'users', group: 'admin', title: 'Users', render: users, admin: true },
+  { id: 'integrations', group: 'infrastructure', title: 'Integrations', render: integrations, admin: true },
+  { id: 'companies', group: 'platform', title: 'Companies', render: companies, platform: true },
+  { id: 'people', group: 'platform', title: 'People', render: people, platform: true },
+  { id: 'audit', group: 'admin', title: 'Audit log', render: auditLog, admin: true },
+  { id: 'profile', group: 'account', title: 'My profile', render: profile },
 ];
+
+// The sidebar, in groups: what you look at most first, account items at the bottom. An empty group (nothing the person may see) is left out.
+const NAV_GROUPS = [['top', null], ['protection', 'Protection'], ['infrastructure', 'Infrastructure'], ['admin', 'Administration'], ['platform', 'Platform']];
 
 const visible = (p) => (!p.admin || isAdmin()) && (!p.noTechnician || me.role !== 'company_technician') && (!p.platform || me.platform);
 
@@ -71,17 +81,22 @@ function companySwitcher() {
 }
 
 function sidebar(page) {
+  const navLink = (p) => h('a', { class: `nav${p.id === page.id ? ' active' : ''}`, href: `/companies/${me.company.company_slug}/${p.id}`, 'aria-current': p.id === page.id ? 'page' : false,
+    onclick: (e) => { e.preventDefault(); go(p.id); } }, p.title);
   return h('nav', { class: 'side', 'aria-label': 'Main' },
     h('div', { class: 'brand' }, h('strong', {}, me.company.company_name), h('span', {}, `${ROLE_LABEL[me.role]} · ${me.user.username}`)),
     me.acting && h('div', { class: 'error', role: 'status', style: 'margin:8px 0' }, `Working inside ${me.company.company_name} ${me.platform ? 'as a platform admin' : `with the access you were granted (${ROLE_LABEL[me.role]})`}. Your changes are recorded in its audit log. `,
       h('button', { class: 'link', onclick: () => { setActing(null); location.assign('/'); } }, 'Back to my company')),
     companySwitcher(),
-    PAGES.filter(visible).map((p) =>
-      h('a', { class: `nav${p.id === page.id ? ' active' : ''}`, href: `/companies/${me.company.company_slug}/${p.id}`, 'aria-current': p.id === page.id ? 'page' : false,
-        onclick: (e) => { e.preventDefault(); go(p.id); } }, p.title)),
-    h('a', { class: 'nav', href: '#', id: 'bell', onclick: (e) => { e.preventDefault(); notifications(); } }, 'Notifications', h('span', { class: 'badge info', id: 'bell-count', hidden: true }, '0')),
+    NAV_GROUPS.map(([key, title]) => {
+      const pages = PAGES.filter((p) => p.group === key && visible(p));
+      return pages.length ? [title && h('div', { class: 'nav-group' }, title), pages.map(navLink)] : null;
+    }),
     h('div', { class: 'spacer' }),
-    h('button', { onclick: logout }, 'Log out'));
+    h('div', { class: 'nav-group' }, 'Account'),
+    PAGES.filter((p) => p.group === 'account' && visible(p)).map(navLink),
+    h('a', { class: 'nav', href: '#', id: 'bell', onclick: (e) => { e.preventDefault(); notifications(); } }, 'Notifications', h('span', { class: 'badge info', id: 'bell-count', hidden: true }, '0')),
+    h('button', { onclick: logout, style: 'margin-top:8px' }, 'Log out'));
 }
 
 // --- live pages ---
@@ -890,7 +905,7 @@ const verifyPanel = (t, paint) => {
 const verifyCard = (rows) => card(`Waiting for a second check (${rows.length})`,
   h('p', { class: 'small muted' }, 'A share of passed tests done by hand, picked at random, is checked by a second person who looks at the screenshots and details. You cannot check your own.'),
   table([
-    { title: 'Server', render: (x) => x.hostname },
+    { title: 'Server', render: serverCell },
     { title: 'Test', render: (x) => label(x.test_type) },
     { title: 'Sample', render: (x) => x.target ?? '—' },
     { title: 'Done by', render: (x) => x.assigned_username ?? '—' },
@@ -1010,7 +1025,7 @@ function manualBody(t, paint, close) {
   return [
     h('h2', {}, t.title, ' ', manualBadge(t.test_status)),
     h('table', { class: 'kv' }, h('tbody', {},
-      h('tr', {}, h('th', {}, 'Server'), h('td', {}, `${t.hostname} (${label(t.backup_method)})`)),
+      h('tr', {}, h('th', {}, 'Server'), h('td', {}, `${t.hostname} (${methodName(t.backup_method)})`)),
       h('tr', {}, h('th', {}, t.target_label), h('td', {}, t.target ? h('strong', {}, t.target) : h('span', { class: 'muted' }, 'Not set. Choose one yourself and note it below.'))),
       h('tr', {}, h('th', {}, 'Being done by'), h('td', {}, t.assigned_username ?? 'Nobody yet')),
       h('tr', {}, h('th', {}, 'Progress'), h('td', {}, `${ticked} of ${t.steps.length} steps ticked`)))),
@@ -1056,7 +1071,7 @@ function manualBody(t, paint, close) {
 const manualCard = (rows) => card(`Tests to do by hand (${rows.length})`,
   h('p', { class: 'small muted' }, 'For backups BMS cannot read itself, such as Microsoft 365 and platform backups, and for any test that is not automated. Open one to see what to sample and follow the checklist.'),
   table([
-    { title: 'Server', render: (x) => x.hostname },
+    { title: 'Server', render: serverCell },
     { title: 'Test', render: (x) => label(x.test_type) },
     { title: 'Sample', render: (x) => x.target ?? h('span', { class: 'muted' }, 'Your choice') },
     { title: 'Status', render: (x) => h('span', {}, manualBadge(x.test_status), x.assigned_username ? ` ${x.assigned_username}` : '') },
@@ -1070,10 +1085,10 @@ const browserZone = () => { try { return Intl.DateTimeFormat().resolvedOptions()
 async function scheduleForm(existing) {
   const types = (await testTypes()).filter((t) => t.active || t.type === existing?.test_type);
   const [servers, jobs] = await Promise.all([api('GET', '/servers?limit=1000'), api('GET', '/backup-jobs?limit=1000')]);
-  const targets = [{ value: 'all', label: 'Every server (its newest backup BMS can test)' },
-    ...servers.data.filter((s) => s.active !== false).map((s) => ({ value: `server:${s.id}`, label: `Server: ${s.hostname}` })),
-    ...jobs.data.map((j) => ({ value: `job:${j.id}`, label: `Backup job: ${j.hostname} (${label(j.backup_method)}, #${j.id})` }))];
-  const current = existing ? (existing.target_type === 'all' ? 'all' : existing.target_type === 'server' ? `server:${existing.server_id}` : `job:${existing.backup_job_id}`) : 'all';
+  const serverOptions = servers.data.filter((s) => s.active !== false).map((s) => ({ value: String(s.id), label: `${s.hostname} (${(s.backup_methods ?? []).map(methodName).join(', ') || 'no backup types'})` }));
+  const jobOptions = jobs.data.map((j) => ({ value: String(j.id), label: `${j.hostname}: ${methodName(j.backup_method)} (#${j.id})` }));
+  const kind = existing ? (existing.target_type === 'all' ? 'all' : existing.target_type === 'job' ? 'job' : 'servers') : 'all';
+  const chosen = existing ? (existing.target_type === 'server' ? [String(existing.server_id)] : (existing.server_ids ?? []).map(String)) : [];
   const done = await formModal({
     title: existing ? `Edit schedule "${existing.name}"` : 'Schedule tests', submitLabel: 'Save',
     fields: [
@@ -1081,8 +1096,10 @@ async function scheduleForm(existing) {
       { name: 'who', label: 'Done by', type: 'select', options: [{ value: 'auto', label: 'BMS, automatically' }, { value: 'manual', label: 'A person, by hand (appears under Tests to do by hand)' }], value: existing?.manual ? 'manual' : 'auto',
         hint: 'BMS can only run the tests marked Automated. Choose a person for the rest, for backups BMS cannot read such as Microsoft 365 and Acronis, or when you want a human to check.' },
       { name: 'test_type', label: 'Test', type: 'select', options: types.map((t) => ({ value: t.type, label: t.automated ? t.title : `${t.title} (by hand only)` })), value: existing?.test_type ?? 'random_restore', help: Object.fromEntries(types.map((t) => [t.type, t.automated ? `${t.summary} Runs: ${t.runs}` : `${t.summary.replace(/^Not built: would /, 'A person ')}`])) },
-      { name: 'target', label: 'What to test', type: 'select', options: targets, value: current,
-        hint: 'A server or company-wide schedule tests each server’s newest successful backup. File tests (restore, write and read-back, full read-back, permissions) cover backups BMS can read: rsync, robocopy and manual copies. A recovery point check covers every method, each one checked separately, including Acronis.' },
+      { name: 'target_kind', label: 'What to test', type: 'select', value: kind, options: [{ value: 'all', label: 'Every server' }, { value: 'servers', label: 'Selected servers (choose below)' }, { value: 'job', label: 'One backup job (choose below)' }],
+        hint: 'Each server\u2019s newest successful backup of a kind the test can use. File tests (restore, write and read-back, full read-back, permissions) cover backups BMS can read: rsync, robocopy and manual copies. A recovery point check, and any test done by a person, covers every type, each one separately, including Acronis.' },
+      { name: 'servers', label: 'Servers (for Selected servers)', type: 'checks', stacked: true, selectAll: true, options: serverOptions, value: chosen },
+      { name: 'job', label: 'Backup job (for One backup job)', type: 'select', options: jobOptions.length ? jobOptions : [{ value: '', label: 'No backup jobs yet' }], value: existing?.backup_job_id ? String(existing.backup_job_id) : (jobOptions[0]?.value ?? '') },
       { name: 'frequency', label: 'How often', type: 'select', options: [{ value: 'daily', label: 'Every day' }, { value: 'weekly', label: 'Every week' }, { value: 'monthly', label: 'Every month' }, { value: 'custom', label: 'Custom (cron)' }], value: existing?.frequency ?? 'weekly' },
       { name: 'run_time', label: 'Time of day (24 hour, HH:MM)', value: existing?.run_time ?? '02:00', hint: 'Not used for a custom schedule.' },
       { name: 'weekday', label: 'Day of the week (weekly only)', type: 'select', options: WEEKDAYS.map((d, i) => ({ value: String(i), label: d })), value: String(existing?.frequency === 'weekly' ? existing.run_day : 1) },
@@ -1091,10 +1108,9 @@ async function scheduleForm(existing) {
       { name: 'timezone', label: 'Time zone', value: existing?.timezone ?? browserZone(), hint: 'The time of day above is in this zone, for example Africa/Johannesburg or UTC.' },
     ],
     onSubmit: async (v) => {
-      const [kind, id] = v.target.split(':');
-      const body = { name: v.name.trim(), test_type: v.test_type, manual: v.who === 'manual', target_type: kind, frequency: v.frequency, timezone: v.timezone.trim() };
-      if (kind === 'server') body.server_id = Number(id);
-      if (kind === 'job') body.backup_job_id = Number(id);
+      const body = { name: v.name.trim(), test_type: v.test_type, manual: v.who === 'manual', target_type: v.target_kind, frequency: v.frequency, timezone: v.timezone.trim() };
+      if (v.target_kind === 'servers') body.server_ids = v.servers.map(Number);
+      if (v.target_kind === 'job') body.backup_job_id = Number(v.job);
       if (v.frequency === 'custom') body.cron = v.cron.trim();
       else {
         body.run_time = v.run_time.trim();
@@ -1111,7 +1127,7 @@ const scheduleCard = (rows) => card(`Test schedules (${rows.length})`,
   h('p', { class: 'small muted' }, 'Recurring tests. Each one queues its tests at the set time and the engine runs them within a minute. If BMS was off at the time, the schedule runs once when it is back. Times are shown in your browser’s zone.'),
   table([
     { title: 'Name', render: (s) => s.name },
-    { title: 'Tests', render: (s) => s.target_name },
+    { title: 'Tests', render: (s) => h('span', {}, s.target_name, s.methods?.length ? h('div', { class: 'small muted' }, s.methods.map(methodName).join(', ')) : '') },
     { title: 'Test', render: (s) => (s.manual ? h('span', {}, label(s.test_type), ' ', badge('info', 'By hand')) : label(s.test_type)) },
     { title: 'Repeats', render: (s) => s.describe },
     { title: 'Next run', render: (s) => (s.enabled ? fmtDate(s.next_run_at) : badge('warning', 'Paused')) },
@@ -1165,13 +1181,13 @@ async function tests() {
     verify.data.length ? verifyCard(verify.data) : null,
     sched && scheduleCard(sched.data),
     card(`Open failures (${f.pagination.total_count})`, table([
-      { title: 'Server', render: (x) => x.hostname }, { title: 'Test', render: (x) => label(x.test_type) },
+      { title: 'Server', render: serverCell }, { title: 'Test', render: (x) => label(x.test_type) },
       { title: 'Type', render: (x) => label(x.failure_type) }, { title: 'Severity', render: (x) => badge(x.severity) },
       { title: 'Item', render: (x) => x.failed_item ?? '—' }, { title: 'When', render: (x) => fmtAgo(x.created_at) },
       { title: '', render: (x) => canResolve && h('button', { class: 'link', onclick: () => resolveForm(x) }, 'Resolve') },
     ], f.data, { empty: 'No open failures.' })),
     card('Test history', table([
-      { title: 'Server', render: (x) => x.hostname }, { title: 'Type', render: (x) => (x.manual ? h('span', {}, label(x.test_type), ' ', badge('info', 'By hand'), x.assigned_username ? ` ${x.assigned_username}` : '', x.verify_state ? h('span', { style: 'margin-left:6px' }, badge(VERIFY_STATE[x.verify_state][1], x.verify_state === 'pending' ? 'Awaiting check' : `${x.verify_state === 'confirmed' ? 'Checked' : 'Rejected'} by ${x.verified_username}`)) : '') : label(x.test_type)) }, { title: 'Status', render: (x) => badge(x.test_status === 'success' ? 'passed' : x.test_status, label(x.test_status)) },
+      { title: 'Server', render: serverCell }, { title: 'Type', render: (x) => (x.manual ? h('span', {}, label(x.test_type), ' ', badge('info', 'By hand'), x.assigned_username ? ` ${x.assigned_username}` : '', x.verify_state ? h('span', { style: 'margin-left:6px' }, badge(VERIFY_STATE[x.verify_state][1], x.verify_state === 'pending' ? 'Awaiting check' : `${x.verify_state === 'confirmed' ? 'Checked' : 'Rejected'} by ${x.verified_username}`)) : '') : label(x.test_type)) }, { title: 'Status', render: (x) => badge(x.test_status === 'success' ? 'passed' : x.test_status, label(x.test_status)) },
       { title: 'Hash match', render: (x) => (x.hash_match == null ? '—' : x.hash_match ? 'Yes' : 'No') },
       { title: 'Compared with source', render: (x) => (x.source_status === 'verified' ? badge('success', 'Matches')
         : x.source_status === 'mismatch' ? badge('failed', 'Differs')

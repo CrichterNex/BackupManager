@@ -30,16 +30,30 @@ class TestScheduleController extends Controller
         return response()->json(['success' => true, 'data' => $out]);
     }
 
+    /** "web-01, db-01 and 3 more" for a list of chosen servers. */
+    private static function serverNames(array $ids): string
+    {
+        $names = Server::whereIn('id', $ids)->orderBy('hostname')->pluck('hostname')->all();
+        if (! $names) {
+            return 'Selected servers (removed)';
+        }
+        $shown = array_slice($names, 0, 3);
+        $more = count($names) - count($shown);
+
+        return (count($names) === 1 ? 'Server ' : count($names).' servers: ').implode(', ', $shown).($more > 0 ? " and $more more" : '');
+    }
+
     private function present(TestSchedule $s): array
     {
         $target = match ($s->target_type) {
             'server' => 'Server '.(Server::find($s->server_id)?->hostname ?? '(removed)'),
+            'servers' => self::serverNames($s->server_ids ?? []),
             'job' => ($j = BackupJob::join('servers as sv', 'sv.id', '=', 'backup_jobs.server_id')->where('backup_jobs.id', $s->backup_job_id)->first(['backup_jobs.id', 'backup_jobs.backup_method', 'sv.hostname']))
                 ? "{$j->hostname}: ".str_replace('_', ' ', $j->backup_method).' backup' : 'Backup job (removed)',
             default => 'Every server with a backup BMS can test',
         };
 
-        return $s->toArray() + [] + ['describe' => TestScheduling::describe($s), 'target_name' => $target];
+        return $s->toArray() + ['describe' => TestScheduling::describe($s), 'target_name' => $target, 'methods' => TestScheduling::methodsFor($s)];
     }
 
     public function index()
@@ -54,7 +68,9 @@ class TestScheduleController extends Controller
             'name' => [$r, 'string', 'min:1', 'max:100'],
             'test_type' => [$r, Rule::in(Constants::TEST_TYPES)],
             'manual' => ['sometimes', 'boolean'],
-            'target_type' => [$r, Rule::in(['all', 'server', 'job'])],
+            'target_type' => [$r, Rule::in(['all', 'server', 'servers', 'job'])],
+            'server_ids' => ['sometimes', 'nullable', 'array', 'max:500'],
+            'server_ids.*' => ['integer', 'min:1'],
             'server_id' => ['sometimes', 'nullable', 'integer', 'min:1'],
             'backup_job_id' => ['sometimes', 'nullable', 'integer', 'min:1'],
             'frequency' => [$r, Rule::in(['daily', 'weekly', 'monthly', 'custom'])],
@@ -64,7 +80,7 @@ class TestScheduleController extends Controller
             'timezone' => ['sometimes', 'string', 'max:64'],
             'enabled' => ['sometimes', 'boolean'],
         ]);
-        $m = $b + ($existing ? $existing->only(['name', 'test_type', 'target_type', 'server_id', 'backup_job_id', 'frequency', 'run_time', 'run_day', 'cron', 'timezone', 'enabled', 'manual']) : ['timezone' => 'UTC', 'enabled' => true, 'manual' => false]);
+        $m = $b + ($existing ? $existing->only(['name', 'test_type', 'target_type', 'server_id', 'server_ids', 'backup_job_id', 'frequency', 'run_time', 'run_day', 'cron', 'timezone', 'enabled', 'manual']) : ['timezone' => 'UTC', 'enabled' => true, 'manual' => false]);
         // A test the company does not use cannot be scheduled. An existing schedule can still be paused, renamed or deleted.
         if (! $existing || $m['test_type'] !== $existing->test_type) {
             CompanyTests::assertActive($m['test_type']);
@@ -79,6 +95,11 @@ class TestScheduleController extends Controller
         // Only the fields that belong to the chosen target are kept.
         $m['server_id'] = $m['target_type'] === 'server' ? ($m['server_id'] ?? null) : null;
         $m['backup_job_id'] = $m['target_type'] === 'job' ? ($m['backup_job_id'] ?? null) : null;
+        $ids = $m['target_type'] === 'servers' ? array_values(array_unique(array_map('intval', $m['server_ids'] ?? []))) : [];
+        $m['server_ids'] = $ids ?: null;
+        if ($m['target_type'] === 'servers' && (! $ids || Server::where('active', true)->whereIn('id', $ids)->count() !== count($ids))) {
+            throw ApiException::badRequest($ids ? 'One of the chosen servers is not one of yours.' : 'Choose at least one server.');
+        }
         if ($m['target_type'] === 'server' && ! (Server::where('active', true)->whereKey($m['server_id'])->exists())) {
             throw ApiException::badRequest('Choose one of your servers.');
         }

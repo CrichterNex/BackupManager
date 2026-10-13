@@ -42,6 +42,9 @@ real data.
 - Roles: company admin, manager (read-only apart from reports), technician (assigned servers only)
 - Web UI: dashboard, servers, backups, tests and failure resolution, reports, users, audit log, notifications,
   and a Companies page for platform admins
+- The sidebar is grouped: Dashboard; Protection (Backups, Tests, Reports); Infrastructure (Servers, Agents, Locations, Integrations);
+  Administration (Users, Audit log, admins only); Platform (Companies, People, platform admins only); and Account (profile,
+  notifications, log out) at the bottom. Groups a person cannot use are left out.
 - Every page updates itself every 15 seconds, so statuses move without a reload. It waits while a dialog is open, a field
   has been edited, a section is expanded, text is selected or the tab is hidden, and a small "Live · updated" note in the
   corner shows it is working. Reads have their own allowance (7200 an hour, `BMS_READ_RATE_LIMIT_PER_HOUR`), separate from the 1000 an hour for changes, so open tabs never block someone from making a change.
@@ -114,8 +117,10 @@ cron entry) is running. If a test sits at *pending*, that is the first thing to 
 
 ### Test schedules
 The Tests page has a **Test schedules** card where company admins set up recurring tests (managers can see them):
-- **What to test:** every server (each one's newest successful backup that BMS can read), one server, or one backup job.
-  Platform backups such as Acronis are not restore-tested by BMS, so they are left out.
+- **What to test:** every server, **several chosen servers** (a checklist with *Select all*), or one backup job. For each server it is the
+  newest successful backup of a kind the test can use. The schedule lists the backup types it covers (Acronis, Robocopy and so on).
+  File tests (restore, write and read-back, full read-back, permissions) can only read file-copy backups, so platform backups such as
+  Acronis are left out of them. A Recovery point check, and any test done by a person, covers every type, each one separately.
 - **How often:** every day, week or month at a time of day in a time zone you choose (it defaults to your browser's), or a
   custom cron expression. Nothing runs more often than hourly.
 - **Manage:** pause and resume, edit, **Run now** (queues the tests immediately and leaves the next run alone) and delete.
@@ -132,6 +137,9 @@ The Tests page has a **Test schedules** card where company admins set up recurri
   takes over, and one less frequent leaves the weekly check running between its runs.
 - Five tests are built and can be scheduled. The Tests page explains each one, says where it runs, and lists the three that are
   not built (database integrity, incremental chain, Microsoft 365 mailbox), which are recorded as skipped, never as a pass.
+
+Wherever tests are listed (history, open failures, tests to do by hand, second checks), the server's **type of backup** is shown beside
+its name, because one server can have several (Acronis, Robocopy, Rsync, Windows manual copy and so on).
 
 ### The tests
 | Test | What it proves | Runs |

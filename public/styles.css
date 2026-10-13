@@ -18,7 +18,7 @@ a { color: var(--accent); }
 
 /* layout */
 .shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
-.side { background: var(--card); border-right: 1px solid var(--line); padding: 20px 12px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 4px; }
+.side { background: var(--card); border-right: 1px solid var(--line); padding: 20px 12px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
 .brand { padding: 4px 12px 16px; } .brand strong { display: block; font-size: 16px; } .brand span { font-size: 12px; color: var(--muted); }
 .side a.nav { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-radius: 6px; color: var(--text); text-decoration: none; }
 .side a.nav:hover { background: var(--bg); } .side a.nav.active { background: var(--info-bg); color: var(--accent-dark); font-weight: 500; }
@@ -91,3 +91,8 @@ input, select, textarea { font: inherit; width: 100%; padding: 8px 10px; border:
 .kv th { width: 30%; white-space: nowrap; }
 .modal h3 { margin: 20px 0 10px; font-size: 15px; }
 .refbox { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; background: rgba(127,127,127,.08); }
+.checks.stacked { flex-direction: column; flex-wrap: nowrap; gap: 6px; max-height: 280px; overflow: auto; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+/* Sidebar group headings. On a narrow screen the links sit in a row, so the headings are dropped. */
+.nav-group { margin: 16px 12px 4px; font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.side .brand + .nav-group, .side > a.nav:first-of-type { margin-top: 0; }
+@media (max-width: 760px) { .side .nav-group { display: none; } }

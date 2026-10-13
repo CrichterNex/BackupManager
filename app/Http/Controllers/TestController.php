@@ -22,7 +22,7 @@ class TestController extends Controller
             ->join('servers as s', 's.id', '=', 'j.server_id')
             ->leftJoin('users as au', 'au.id', '=', 'backup_test_executions.assigned_to')
             ->leftJoin('users as vb', 'vb.id', '=', 'backup_test_executions.verified_by')
-            ->select('backup_test_executions.*', 's.hostname', 'au.username as assigned_username', 'vb.username as verified_username');
+            ->select('backup_test_executions.*', 's.hostname', 'j.backup_method', 'au.username as assigned_username', 'vb.username as verified_username');
     }
 
     public function index(Request $request)
@@ -86,7 +86,7 @@ class TestController extends Controller
             ->join('backup_test_executions as t', 't.id', '=', 'backup_test_failures.test_execution_id')
             ->join('backup_jobs as j', 'j.id', '=', 't.backup_job_id')
             ->join('servers as s', 's.id', '=', 'j.server_id')
-            ->select('backup_test_failures.*', 't.test_type', 's.hostname');
+            ->select('backup_test_failures.*', 't.test_type', 's.hostname', 'j.backup_method');
     }
 
     public function failureIndex(Request $request)

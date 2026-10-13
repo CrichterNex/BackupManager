@@ -81,40 +81,60 @@ final class TestScheduling
      * successful backup, which is the one a restore would use. Returns how many were queued. Anything already queued or running for the
      * same job and test is left alone, so a slow test is never stacked up.
      */
-    public static function queue(TestSchedule $s, ?int $userId): int
+    /**
+     * The backups a schedule covers, one row each with its server and method. A job-level schedule is that job. Otherwise it is each chosen
+     * server's (or every server's) newest successful backup of the kind being tested, so a later backup of another kind (a platform backup,
+     * say) never hides it.
+     */
+    private static function eligible(TestSchedule $s)
     {
         // A recovery point check reads BMS's own records, so it covers every method, and so does a test a person does by hand. The rest read
         // the backup location, which BMS can only do for file-copy methods.
         $perMethod = $s->test_type === 'recovery_point' || $s->manual;
         $methods = $perMethod ? Constants::BACKUP_METHODS : Constants::FILESYSTEM_METHODS;
         $jobs = BackupJob::query()->join('servers as s', 's.id', '=', 'backup_jobs.server_id')
-            ->where('s.active', true)->whereIn('backup_jobs.backup_method', $methods)->select('backup_jobs.id');
+            ->where('s.active', true)->whereIn('backup_jobs.backup_method', $methods)->select('backup_jobs.id', 'backup_jobs.server_id', 'backup_jobs.backup_method');
         if ($s->target_type === 'job') {
-            $jobs->where('backup_jobs.id', $s->backup_job_id);
-        } else {
-            $s->target_type === 'server' && $jobs->where('backup_jobs.server_id', $s->server_id);
-            // The newest successful backup of the kind being tested, so a later backup of another kind (a platform backup, say) never hides it.
-            // A recovery point check looks at each method separately, because each one has its own freshness. The others pick one per server.
-            $methods = implode(',', array_map(fn ($m) => "'$m'", $methods));
-            $sameMethod = $perMethod ? 'AND b2.backup_method = backup_jobs.backup_method' : '';
-            $jobs->where('backup_jobs.status', 'success')->whereRaw(
-                "backup_jobs.id = (SELECT MAX(b2.id) FROM backup_jobs b2 WHERE b2.server_id = backup_jobs.server_id AND b2.deleted_at IS NULL AND b2.status = 'success' AND b2.backup_method IN ($methods) $sameMethod)"
-            );
+            return $jobs->where('backup_jobs.id', $s->backup_job_id);
         }
+        $s->target_type === 'server' && $jobs->where('backup_jobs.server_id', $s->server_id);
+        $s->target_type === 'servers' && $jobs->whereIn('backup_jobs.server_id', $s->server_ids ?? []);
+        // A recovery point check (and a test by hand) looks at each method separately, because each one has its own freshness and its own
+        // way of being tested. The others pick one per server.
+        $list = implode(',', array_map(fn ($m) => "'$m'", $methods));
+        $sameMethod = $perMethod ? 'AND b2.backup_method = backup_jobs.backup_method' : '';
+
+        return $jobs->where('backup_jobs.status', 'success')->whereRaw(
+            "backup_jobs.id = (SELECT MAX(b2.id) FROM backup_jobs b2 WHERE b2.server_id = backup_jobs.server_id AND b2.deleted_at IS NULL AND b2.status = 'success' AND b2.backup_method IN ($list) $sameMethod)"
+        );
+    }
+
+    /** The backup types a schedule covers right now, for showing next to it. @return list<string> */
+    public static function methodsFor(TestSchedule $s): array
+    {
+        return self::eligible($s)->pluck('backup_jobs.backup_method')->unique()->sort()->values()->all();
+    }
+
+    /**
+     * Queue the tests a schedule covers. Anything already queued or running for the same job and test is left alone, so a slow test is never
+     * stacked up. Returns how many were queued.
+     */
+    public static function queue(TestSchedule $s, ?int $userId): int
+    {
         $queued = 0;
-        foreach ($jobs->pluck('backup_jobs.id') as $jobId) {
-            $busy = BackupTestExecution::where('backup_job_id', $jobId)->where('test_type', $s->test_type)->where('manual', (bool) $s->manual)->whereIn('test_status', ['pending', 'running'])->exists();
+        foreach (self::eligible($s)->get() as $job) {
+            $busy = BackupTestExecution::where('backup_job_id', $job->id)->where('test_type', $s->test_type)->where('manual', (bool) $s->manual)->whereIn('test_status', ['pending', 'running'])->exists();
             if ($busy) {
                 continue;
             }
             if ($s->manual) {
                 // Nobody has started it yet, so nobody is recorded as having done it. The sample item (a mailbox, say) is picked now so the tester sees it.
-                $server = Server::find(BackupJob::whereKey($jobId)->value('server_id'));
-                BackupTestExecution::create(['backup_job_id' => $jobId, 'test_type' => $s->test_type, 'manual' => true, 'target' => $server ? ManualTestController::pickTarget($server) : null,
+                $server = Server::find($job->server_id);
+                BackupTestExecution::create(['backup_job_id' => $job->id, 'test_type' => $s->test_type, 'manual' => true, 'target' => $server ? ManualTestController::pickTarget($server) : null,
                     'reference' => $server && $s->test_type === 'm365_mailbox' ? ManualTestController::pickReference($server) : null,
                     'selection' => $server && $s->test_type === 'm365_mailbox' ? ManualSelection::generate($server->timezone ?: 'UTC') : null, 'notes' => 'Scheduled: '.$s->name]);
             } else {
-                BackupTestExecution::create(['backup_job_id' => $jobId, 'test_type' => $s->test_type, 'executed_by' => $userId, 'notes' => 'Scheduled: '.$s->name]);
+                BackupTestExecution::create(['backup_job_id' => $job->id, 'test_type' => $s->test_type, 'executed_by' => $userId, 'notes' => 'Scheduled: '.$s->name]);
             }
             $queued++;
         }

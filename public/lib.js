@@ -101,7 +101,9 @@ export function formModal({ title, fields, submitLabel = 'Save', onSubmit }) {
         input.value = f.value ?? f.options[0]?.value ?? '';
       } else if (f.type === 'checks') {
         const boxes = f.options.map((o) => h('input', { type: 'checkbox', value: o.value, checked: (f.value ?? []).includes(o.value) }));
-        input = h('div', { class: 'checks' }, f.options.map((o, i) => h('label', {}, boxes[i], o.label)));
+        const all = f.selectAll ? h('div', { class: 'row small', style: 'margin-bottom:4px' }, h('button', { type: 'button', class: 'link', onclick: () => boxes.forEach((b) => { b.checked = true; }) }, 'Select all'), h('button', { type: 'button', class: 'link', onclick: () => boxes.forEach((b) => { b.checked = false; }) }, 'Clear')) : null;
+        const list = h('div', { class: f.stacked ? 'checks stacked' : 'checks' }, f.options.map((o, i) => h('label', {}, boxes[i], o.label)));
+        input = all ? h('div', {}, all, list) : list;
         input.values = () => boxes.filter((b) => b.checked).map((b) => b.value);
       } else if (f.type === 'textarea') {
         input = h('textarea', { id: `f_${f.name}`, rows: 3, value: f.value ?? '' });

@@ -15,6 +15,6 @@ class TestSchedule extends Model
 
     protected function casts(): array
     {
-        return ['enabled' => 'boolean', 'manual' => 'boolean', 'next_run_at' => 'datetime', 'last_run_at' => 'datetime'];
+        return ['enabled' => 'boolean', 'manual' => 'boolean', 'server_ids' => 'array', 'next_run_at' => 'datetime', 'last_run_at' => 'datetime'];
     }
 }
