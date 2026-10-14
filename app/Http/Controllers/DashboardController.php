@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\BackupFailure;
 use App\Models\BackupJob;
 use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
@@ -67,6 +68,12 @@ class DashboardController extends Controller
             ->join('backup_jobs as j', 'j.id', '=', 't.backup_job_id')->where('backup_test_failures.resolved', false);
         Scope::technician($failureQuery, $me, 'j.server_id');
         $open = $failureQuery->count();
+        $backupFailureQuery = BackupFailure::query()->join('servers as s', 's.id', '=', 'backup_failures.server_id')->where('backup_failures.resolved', false);
+        Scope::technician($backupFailureQuery, $me, 's.id');
+        $openBackup = $backupFailureQuery->count();
+        $missedQuery = BackupFailure::query()->join('servers as s', 's.id', '=', 'backup_failures.server_id')->where('backup_failures.first_seen_at', '>=', now()->subDays(30));
+        Scope::technician($missedQuery, $me, 's.id');
+        $missed = (int) $missedQuery->sum('backup_failures.missed_runs');
 
         $recentQuery = BackupJob::query()->join('servers as s', 's.id', '=', 'backup_jobs.server_id')->whereNotNull('backup_jobs.completed_time');
         Scope::technician($recentQuery, $me, 'backup_jobs.server_id');
@@ -79,13 +86,14 @@ class DashboardController extends Controller
         return [
             'company' => ['id' => CompanyContext::id(), 'name' => ($company = Company::find(CompanyContext::id()))->name, 'slug' => $company->slug],
             'servers' => ['total' => (int) $srv->total, 'failing' => (int) $srv->failing],
-            'backups_30d' => ['finished' => $finished, 'success' => (int) $jobs->success, 'warning' => (int) $jobs->warning, 'failed' => (int) $jobs->failed],
+            'backups_30d' => ['finished' => $finished, 'success' => (int) $jobs->success, 'warning' => (int) $jobs->warning, 'failed' => (int) $jobs->failed, 'missed' => $missed],
             'tests' => [
                 'last_24h' => ['total' => (int) $t->day_total, 'passed' => (int) $t->day_passed],
                 'last_7d' => ['total' => (int) $t->week_total, 'passed' => (int) $t->week_passed],
                 'last_30d' => ['total' => (int) $t->month_total, 'passed' => (int) $t->month_passed],
             ],
             'unresolved_failures' => $open,
+            'unresolved_backup_failures' => $openBackup,
             'health_score' => self::healthScore($rate((int) $jobs->success + (int) $jobs->warning, $finished), $rate((int) $t->month_passed, (int) $t->month_total)),
             'recent_backups' => $recent,
         ];

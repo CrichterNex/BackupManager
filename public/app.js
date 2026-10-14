@@ -343,9 +343,10 @@ async function dashboard() {
     h('div', { class: 'grid' },
       metric('Health score', score ?? '—', tone, score == null ? 'No backups or tests yet' : 'Last 30 days'),
       metric('Servers', d.servers.total, '', `${d.servers.failing} with failures`, d.servers.failing ? 'bad' : ''),
-      metric('Backups (30d)', b.finished, '', `${b.success} ok · ${b.warning} warning · ${b.failed} failed`),
+      metric('Backups (30d)', b.finished, '', `${b.success} ok · ${b.warning} warning · ${b.failed} failed${b.missed ? ` · ${b.missed} missed` : ''}`),
       metric('Tests passed (7d)', pct(d.tests.last_7d), '', `${d.tests.last_7d.passed} of ${d.tests.last_7d.total}`),
-      metric('Open test failures', d.unresolved_failures, d.unresolved_failures ? 'bad' : 'ok', d.unresolved_failures ? 'Need review' : 'All clear')),
+      metric('Open test failures', d.unresolved_failures, d.unresolved_failures ? 'bad' : 'ok', d.unresolved_failures ? 'Need review' : 'All clear'),
+      metric('Backup problems to review', d.unresolved_backup_failures, d.unresolved_backup_failures ? 'bad' : 'ok', d.unresolved_backup_failures ? 'Need review' : 'All clear')),
     card('Recent backups', table([
       { title: 'Server', render: (r) => r.hostname }, { title: 'Method', render: (r) => label(r.backup_method) },
       { title: 'Status', render: (r) => badge(r.status) }, { title: 'Size', render: (r) => (r.size_gb != null ? `${r.size_gb} GB` : '—') },
@@ -420,7 +421,7 @@ async function serverDetail(s) {
       row('Health', badge(full.status)), row('Type', full.os_type === 'microsoft_365' ? 'Microsoft 365 tenant' : label(full.os_type)), full.os_type !== 'microsoft_365' && row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
       row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
       row('Last backup', `${label(full.last_backup_status)} · ${fmtDate(full.last_backup_time)}`), row('Last test', `${label(full.last_test_status)} · ${fmtDate(full.last_test_time)}`),
-      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), full.os_type !== 'microsoft_365' && row('Agent', agentSummary(full.agent)), full.os_type === 'microsoft_365' && row('Test mailboxes', (full.test_targets ?? []).join(', ') || 'None listed: choose one each time'), full.os_type === 'microsoft_365' && row('Reference items', (full.reference_items ?? []).map((r) => r.label).join(', ') || 'None: tests check the item opens, with no original to compare'), row('Platforms', linksSummary(full.links)), row('Notes', full.notes ?? '—'))),
+      row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), full.os_type !== 'microsoft_365' && row('Agent', agentSummary(full.agent)), full.os_type === 'microsoft_365' && row('Test mailboxes', (full.test_targets ?? []).join(', ') || 'None listed: choose one each time'), full.os_type === 'microsoft_365' && row('Reference items', (full.reference_items ?? []).map((r) => r.label).join(', ') || 'None: tests check the item opens, with no original to compare'), row('Platforms', linksSummary(full.links)), (full.workloads ?? []).map((w) => workloadRow(row, w)), full.validation && full.links.length > 0 && row('Acronis validation', h('span', {}, h('strong', {}, full.validation.confirmed ? 'Plan confirmed' : 'No plan confirmed'), h('div', { class: 'small' }, full.validation.message))), row('Notes', full.notes ?? '—'))),
     h('div', { class: 'actions' },
       isAdmin() && h('button', { class: 'danger', onclick: async () => {
         if (await confirmModal('Delete server?', `${full.hostname} and its backup jobs will be removed from view. History is kept for audit.`, 'Delete')) {
@@ -438,6 +439,12 @@ async function serverDetail(s) {
       h('button', { class: 'primary', onclick: () => overlay.remove() }, 'Close'))));
   document.body.append(overlay);
 }
+const workloadRow = (row, w) => row(w.label, w.summary
+  ? h('span', {}, h('strong', {}, label(w.summary.state)), ` · ${w.summary.items} items: ${w.summary.ok} ok, ${w.summary.warning} with warnings, ${w.summary.failed} failed${w.summary.cancelled ? `, ${w.summary.cancelled} cancelled` : ''}`,
+    h('div', { class: 'small' }, `Last backup ${w.summary.last_run_at ? fmtDate(w.summary.last_run_at) : 'never'}, read from ${w.connection}${w.summary.catching_up ? '. Still catching up on Acronis activity, so counts may be incomplete' : ''}`),
+    Object.keys(w.summary.errors).length > 0 && h('div', { class: 'small' }, `Errors: ${Object.entries(w.summary.errors).map(([c, n]) => `${c} (${n})`).join(', ')}`),
+    w.problems.length > 0 && h('div', { class: 'small' }, 'Failed items: ', w.problems.map((p) => `${p.name}${p.error_code ? ` (${p.error_code})` : ''}`).join(', '))) : 'Nothing read from Acronis yet');
+
 const linksSummary = (links) => (links.length
   ? h('span', {}, links.map((l) => h('div', {},
     `${l.integration.name}: ${l.external_name ?? l.external_id} · ${l.last_status ? label(l.last_status) : 'not read yet'}`,
@@ -724,10 +731,42 @@ async function locationForm(existing) {
 }
 
 // --- backups ---
+// Backup problems somebody has to review. A recovery does not close one: a later success does not make up for backups that were skipped.
+const FAILURE_KIND = { failed: ['Failed', 'failed'], critical: ['Critical (platform)', 'failed'], overdue: ['Overdue', 'warning'], warning: ['Warning', 'info'] };
+const FAILURE_FIX = [
+  { value: 'rerun_succeeded', label: 'The next backup ran fine' }, { value: 'fixed', label: 'I fixed the cause' }, { value: 'platform_issue', label: 'A problem on the backup platform' },
+  { value: 'false_positive', label: 'It was not really a problem' }, { value: 'known_issue', label: 'A known issue we are living with' },
+];
+
+async function reviewFailure(x) {
+  const gap = x.missed_runs > 0 ? ` ${x.missed_runs} scheduled backup${x.missed_runs === 1 ? ' was' : 's were'} missed (about ${x.gap_hours} hours without a good backup). Note whether that gap matters.` : '';
+  const done = await formModal({
+    title: `Review: ${x.hostname}`, submitLabel: 'Close this problem',
+    fields: [
+      { name: 'resolution_type', label: 'What happened', type: 'select', options: FAILURE_FIX, value: x.active ? 'fixed' : 'rerun_succeeded', hint: `${x.message}${gap}` },
+      { name: 'notes', label: 'What you found and what was done', type: 'textarea', required: true, hint: 'Kept in the audit log, so the next person can see why this was closed.' },
+    ],
+    onSubmit: (v) => api('POST', `/backup-failures/${x.id}/resolve`, { resolution_type: v.resolution_type, notes: v.notes.trim() }),
+  });
+  if (done) { toast('Reviewed'); show(); }
+}
+
+const failureCard = (rows) => card(`Backup problems to review (${rows.length})`,
+  h('p', { class: 'small muted' }, 'A backup that failed, that its platform calls critical, that is overdue or has a warning stays here until a person reviews it, even if it recovers by itself. When backups were skipped, the gap is shown: a later success does not make up for them.'),
+  table([
+    { title: 'Server', render: serverCell },
+    { title: 'Problem', render: (x) => badge(FAILURE_KIND[x.kind][1], FAILURE_KIND[x.kind][0]) },
+    { title: 'What was found', render: (x) => h('span', { title: x.message, style: 'display:inline-block;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom' }, x.message) },
+    { title: 'Since', render: (x) => fmtAgo(x.first_seen_at) },
+    { title: 'Now', render: (x) => (x.active ? badge('failed', 'Still a problem') : h('span', {}, badge('success', 'Recovered'), ` ${fmtAgo(x.recovered_at)}`)) },
+    { title: 'Gap', render: (x) => (x.missed_runs > 0 ? badge('warning', `${x.missed_runs} missed \u00b7 ${x.gap_hours} h`) : x.gap_hours != null ? `${x.gap_hours} h` : '\u2014') },
+    { title: '', render: (x) => me.role !== 'company_manager' && h('button', { class: 'link', onclick: () => reviewFailure(x) }, 'Review') },
+  ], rows, { empty: 'Nothing to review.' }));
+
 async function backups() {
-  const [jobs, srv] = await Promise.all([api('GET', '/backup-jobs?limit=200'), api('GET', '/servers?limit=500')]);
+  const [jobs, srv, failures] = await Promise.all([api('GET', '/backup-jobs?limit=200'), api('GET', '/servers?limit=500'), api('GET', '/backup-failures?limit=100')]);
   const addBtn = isAdmin() && h('button', { class: 'primary', onclick: () => jobForm(srv.data) }, 'New backup job');
-  return h('div', {}, topbar('Backups', null, addBtn), card(null, table([
+  return h('div', {}, topbar('Backups', null, addBtn), failureCard(failures.data), card(null, table([
     { title: 'Server', render: (j) => j.hostname }, { title: 'Method', render: (j) => label(j.backup_method) },
     { title: 'Backs up', render: (j) => scopeCell(j) },
     { title: 'Location', render: (j) => j.location_name ? (j.destination_path ? `${j.location_name} / ${j.destination_path}` : j.location_name) : (LOCATION_METHODS.includes(j.backup_method) ? h('span', { class: 'muted' }, 'None set') : h('span', { class: 'muted', title: 'Platform backups use the locations configured on the platform.' }, 'On the platform')) },
@@ -1270,6 +1309,8 @@ async function integrations() {
     card(null, table([
       { title: 'Name', render: (i) => i.name }, { title: 'Platform', render: (i) => label(i.platform) }, { title: 'Datacenter', render: (i) => i.base_url.replace('https://', '') },
       { title: 'Client', render: (i) => h('code', {}, i.client_id_hint ?? '—') },
+      { title: 'Microsoft 365 backups', render: (i) => (i.workloads.length === 0 ? '—' : h('div', {}, i.workloads.map((w) => h('div', { class: 'small' }, h('strong', {}, `${w.label}: `), badge(w.state === 'unknown' ? 'warning' : w.state, label(w.state)), ` ${w.items} items, ${w.ok} ok, ${w.warning} warnings, ${w.failed} failed`,
+        w.failed > 0 && Object.keys(w.errors).length > 0 ? ` (${Object.keys(w.errors).join(', ')})` : '', w.catching_up ? ' · still catching up' : '')))) },
       { title: 'Linked servers', render: (i) => h('span', {}, String(i.links), i.auto_import ? h('div', { class: 'small' }, `Auto-import on (${label(i.auto_import_os)})`) : '') },
       { title: 'Last sync', render: (i) => (i.last_sync_status === 'error'
         ? h('span', {}, badge('failed', 'Error'), h('div', { class: 'small' }, i.last_sync_error))

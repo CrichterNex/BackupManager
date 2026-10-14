@@ -90,8 +90,8 @@ final class TestScheduling
     {
         // A recovery point check reads BMS's own records, so it covers every method, and so does a test a person does by hand. The rest read
         // the backup location, which BMS can only do for file-copy methods.
-        $perMethod = $s->test_type === 'recovery_point' || $s->manual;
-        $methods = $perMethod ? Constants::BACKUP_METHODS : Constants::FILESYSTEM_METHODS;
+        $perMethod = $s->test_type === 'recovery_point' || $s->test_type === 'platform_validation' || $s->manual;
+        $methods = $s->test_type === 'platform_validation' && ! $s->manual ? ['acronis'] : ($perMethod ? Constants::BACKUP_METHODS : Constants::FILESYSTEM_METHODS);
         $jobs = BackupJob::query()->join('servers as s', 's.id', '=', 'backup_jobs.server_id')
             ->where('s.active', true)->whereIn('backup_jobs.backup_method', $methods)->select('backup_jobs.id', 'backup_jobs.server_id', 'backup_jobs.backup_method');
         if ($s->target_type === 'job') {

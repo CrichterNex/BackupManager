@@ -57,19 +57,7 @@ final class ManualFindings
         if (! $point || ! $item) {
             throw ApiException::badRequest('A date or time in the details is not valid.');
         }
-        if ($point->getTimestamp() > $now->getTimestamp() + 300) {
-            throw ApiException::badRequest('The recovery point is in the future. Check its date and time.');
-        }
-        if ($item->getTimestamp() > $point->getTimestamp()) {
-            throw ApiException::badRequest('The item is dated after the recovery point, so it cannot have been restored from it. Check the dates, or use a later recovery point.');
-        }
-        $age = (int) floor(($now->getTimestamp() - $point->getTimestamp()) / 3600);
-        if ($age > $allowedHours) {
-            throw ApiException::badRequest("The recovery point you used is $age hours old, more than the $allowedHours hours allowed. Use the newest one. If there is no newer one, the backup is not keeping up: complete the test as failed.");
-        }
-        if ($findings['attachment'] === 'fails') {
-            throw ApiException::badRequest('An attachment that does not open is a failed restore. Complete the test as failed.');
-        }
+        // Was it the item that was asked for? Said first, because a wrong item also tends to look wrong against the dates, and the item is the real problem.
         if ($selection) {
             $sameDay = $findings['item_day'] === $selection['day'];
             $samePosition = (int) $findings['position_used'] === (int) $selection['position'];
@@ -82,6 +70,19 @@ final class ManualFindings
             if (! ($sameDay && $samePosition) && trim((string) ($findings['fallback_note'] ?? '')) === '') {
                 throw ApiException::badRequest('You were asked to open: '.$selection['text'].' If you used a different item, say why and what you used in the details.');
             }
+        }
+        if ($point->getTimestamp() > $now->getTimestamp() + 300) {
+            throw ApiException::badRequest('The recovery point is in the future. Check its date and time.');
+        }
+        if ($item->getTimestamp() > $point->getTimestamp()) {
+            throw ApiException::badRequest('The item is dated after the recovery point, so it cannot have been restored from it. Check the dates, or use a later recovery point.');
+        }
+        $age = (int) floor(($now->getTimestamp() - $point->getTimestamp()) / 3600);
+        if ($age > $allowedHours) {
+            throw ApiException::badRequest("The recovery point you used is $age hours old, more than the $allowedHours hours allowed. Use the newest one. If there is no newer one, the backup is not keeping up: complete the test as failed.");
+        }
+        if ($findings['attachment'] === 'fails') {
+            throw ApiException::badRequest('An attachment that does not open is a failed restore. Complete the test as failed.');
         }
     }
 }

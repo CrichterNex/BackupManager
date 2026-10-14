@@ -10,6 +10,7 @@ use App\Models\BackupTestExecution;
 use App\Models\Company;
 use App\Models\Server;
 use App\Services\Audit;
+use App\Services\BackupFailures;
 use App\Services\TestResults;
 use App\Support\ApiException;
 use App\Support\BackupPaths;
@@ -199,7 +200,9 @@ final class AgentService
         $cmd->forceFill(['status' => $status, 'completed_at' => now(), 'output' => $why])->save();
         if ($cmd->type === 'backup' && ($job = BackupJob::find($cmd->backup_job_id))) {
             $job->forceFill(['status' => 'failed', 'completed_time' => now(), 'status_message' => $why])->save();
-            TestResults::notifyAdmins('backup_failed', 'Backup did not run', $why, 'backup_job', $job->id);
+            if ($server = Server::find($job->server_id)) {
+                BackupFailures::report($server, 'agent', $job->backup_method, 'failed', $why, $job->id, self::gapFor($job));
+            }
         } elseif ($cmd->test_execution_id) {
             self::record($cmd->test_execution_id, ['success' => false, 'failure_type' => $status === 'expired' ? 'timeout' : 'restore_failed', 'severity' => 'high', 'error_message' => $why]);
         }
@@ -234,6 +237,17 @@ final class AgentService
         });
     }
 
+    /** The last good backup of this job's server and method before this one, and how often one is expected, for measuring a gap. */
+    private static function gapFor(BackupJob $job): array
+    {
+        $previous = BackupJob::where('server_id', $job->server_id)->where('backup_method', $job->backup_method)->where('status', 'success')
+            ->where('id', '<>', $job->id)->whereNotNull('completed_time')->max('completed_time');
+        $server = Server::find($job->server_id);
+
+        return ['last_good_at' => $previous ? CarbonImmutable::parse($previous) : null, 'back_at' => CarbonImmutable::now(),
+            'interval' => $server ? BackupFailures::intervalSeconds($server, $job->backup_method, $job->schedule) : null];
+    }
+
     private static function finishBackup(AgentCommand $cmd, bool $ok, array $r): void
     {
         $job = BackupJob::find($cmd->backup_job_id);
@@ -243,8 +257,8 @@ final class AgentService
         $message = $ok ? null : (trim((string) ($r['output'] ?? '')) !== '' ? Str::limit(trim($r['output']), 500, '') : 'The backup action exited with an error.');
         $job->forceFill(['status' => $ok ? 'success' : 'failed', 'completed_time' => now(), 'status_message' => $message])->save();
         Server::whereKey($job->server_id)->update(['last_backup_time' => now(), 'last_backup_status' => $ok ? 'success' : 'failed', 'updated_at' => now()]);
-        if (! $ok) {
-            TestResults::notifyAdmins('backup_failed', 'Backup failed', $message, 'backup_job', $job->id);
+        if ($server = Server::find($job->server_id)) {
+            BackupFailures::report($server, 'agent', $job->backup_method, $ok ? null : 'failed', $message, $job->id, self::gapFor($job));
         }
     }
 

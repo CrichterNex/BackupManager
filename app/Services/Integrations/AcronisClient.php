@@ -193,6 +193,90 @@ final class AcronisClient
         return $this->get($path, $query);
     }
 
+    /** Acronis's own ids for the commands behind validation and replication. The title is used too, in case an id differs on another datacenter. */
+    public const VALIDATION_RUN = '58F58E51-A7F4-408E-8619-90D9C67AE8C9';
+
+    public const VALIDATION = '489B4D82-0676-4F49-BC9F-C6F504A10721';
+
+    private const REPLICATION = ['4B40E257-1B18-47F2-AA94-72A4B1D6E4DF', '44EEE32F-FC8A-4E37-B5BA-A8B16CDC06D6'];
+
+    /** The command Acronis logs for one Microsoft 365 item's backup, and the kind of item each resource type is. */
+    private const C2C_BACKUP = '0016750A-EE56-49E6-BF59-7C768C9869AC';
+
+    private const WORKLOAD_RESOURCES = ['MAILBOX' => 'mailbox', 'DRIVE' => 'onedrive', 'TEAM' => 'teams', 'SITE' => 'sharepoint'];
+
+    /** mailbox, onedrive, teams or sharepoint for a finished Microsoft 365 backup of one item, or null for anything else (including Acronis's own cleanup of old backups). */
+    public static function workloadOf(array $a): ?string
+    {
+        if (strtoupper((string) ($a['type'] ?? '')) !== self::C2C_BACKUP || ($a['state'] ?? null) !== 'completed') {
+            return null;
+        }
+
+        return self::WORKLOAD_RESOURCES[strtoupper((string) ($a['resource']['type'] ?? ''))] ?? null;
+    }
+
+    /** validation_run (a pass over a device's backups), validation (one backup's check within a run), replication, or null for any other activity. */
+    public static function checkKind(array $a): ?string
+    {
+        $type = strtoupper((string) ($a['type'] ?? ''));
+        $title = (string) ($a['context']['title'] ?? '');
+
+        return match (true) {
+            $type === self::VALIDATION_RUN || stripos($title, 'Validating backups') === 0 => 'validation_run',
+            $type === self::VALIDATION || $title === 'Validating' => 'validation',
+            in_array($type, self::REPLICATION, true) || stripos($title, 'Replicat') === 0 => 'replication',
+            default => null,
+        };
+    }
+
+    /**
+     * Validation and replication activities from a cursor on, oldest first. Returns them with the cursor the last page was fetched from, so
+     * the next read starts there: it sees the same last page again, which is harmless because activities are stored by their id.
+     *
+     * With no cursor it starts at $since, not at the beginning of Acronis's history, because a busy tenant logs thousands of activities a day. Besides
+     * validation and replication it keeps the finished Microsoft 365 item backups. `through` is how far the read got: now once it reached the end of the log, otherwise when the newest activity read was last updated.
+     *
+     * @return array{items: list<array<string, mixed>>, cursor: ?string, through: ?CarbonImmutable}
+     */
+    public function checksFrom(?string $cursor, int $maxPages = 40, ?CarbonImmutable $since = null): array
+    {
+        $items = [];
+        $last = $cursor;
+        $through = null;
+        $caughtUp = false;
+        for ($i = 0; $i < $maxPages; $i++) {
+            // A cursor already carries the filter it was made with, so it is sent alone.
+            $query = $cursor ? ['limit' => 1000, 'after' => $cursor] : array_filter(['limit' => 1000, 'updatedAt' => $since ? 'gt('.$since->utc()->format('Y-m-d\TH:i:s\Z').')' : null]);
+            try {
+                $r = $this->get('/task_manager/v2/activities', $query);
+            } catch (IntegrationException $e) {
+                if ($i === 0) {
+                    throw $e;
+                }
+                break; // keep what earlier pages gave: the next sync carries on from there
+            }
+            $page = $r['items'] ?? [];
+            foreach ($page as $a) {
+                if (self::checkKind($a) !== null || self::workloadOf($a) !== null) {
+                    $items[] = $a;
+                }
+                $u = self::parseTime($a['updatedAt'] ?? null);
+                $through = $u && (! $through || $u->gt($through)) ? $u : $through;
+            }
+            $last = $cursor;
+            $next = $r['paging']['cursors']['after'] ?? null;
+            if (! $next || count($page) < 1000) {
+                $caughtUp = true;
+
+                break;
+            }
+            $cursor = $next;
+            $last = $cursor;
+        }
+
+        return ['items' => $items, 'cursor' => $last, 'through' => $caughtUp ? CarbonImmutable::now() : $through];
+    }
+
     /** Raw first page, for the probe command only. Never stored. */
     public function rawFirstPage(): array
     {

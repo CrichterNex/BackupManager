@@ -86,6 +86,15 @@ final class ManualChecklists
                 ['id' => 'retention', 'text' => 'Confirm older points exist as far back as the retention policy says. Note the oldest.', 'evidence' => 'note', 'required' => false],
             ],
         ],
+        'platform_validation' => [
+            'target' => 'The Acronis device to check',
+            'steps' => [
+                ['id' => 'open', 'text' => 'Open the Acronis console and find the validation results for the device shown above.', 'evidence' => 'none', 'required' => false],
+                ['id' => 'latest', 'text' => 'Note the newest validation run: when it started, whether it finished, and its result. Screenshot it.', 'evidence' => 'note', 'required' => true, 'files' => 1],
+                ['id' => 'errors', 'text' => 'Check no backup in that run errored. If any did, note the error and whether it is a credential problem or damage.', 'evidence' => 'note', 'required' => false],
+                ['id' => 'plan', 'text' => 'Confirm the validation plan is applied to the device and scheduled to run again.', 'evidence' => 'none', 'required' => false],
+            ],
+        ],
         'file_permissions' => [
             'target' => 'The folder to sample',
             'steps' => [

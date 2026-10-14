@@ -10,6 +10,8 @@ use App\Models\Server;
 use App\Models\ServerLink;
 use App\Models\User;
 use App\Services\Audit;
+use App\Services\PlatformValidation;
+use App\Services\PlatformWorkloads;
 use App\Support\ApiException;
 use App\Support\CompanyContext;
 use App\Support\Constants;
@@ -65,7 +67,7 @@ class ServerController extends Controller
         $assigned = DB::table('server_assignments as a')->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('a.server_id', $server->id)->orderBy('u.username')->get(['u.id', 'u.username']);
 
-        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned, 'links' => ServerLink::with('integration:id,name,platform')->where('server_id', $server->id)->get(), 'agent' => ($agent = Agent::where('server_id', $server->id)->first()) ? $agent->summary() : ['enrolled' => false]]]);
+        return response()->json(['success' => true, 'data' => [...$server->toArray(), 'assigned_technicians' => $assigned, 'links' => ServerLink::with('integration:id,name,platform')->where('server_id', $server->id)->get(), 'validation' => PlatformValidation::plan($server->id), 'workloads' => PlatformWorkloads::forServer($server->id), 'agent' => ($agent = Agent::where('server_id', $server->id)->first()) ? $agent->summary() : ['enrolled' => false]]]);
     }
 
     private function rules(bool $partial): array

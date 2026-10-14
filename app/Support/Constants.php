@@ -17,7 +17,7 @@ final class Constants
 
     public const TEST_TYPES = [
         'synthetic_file', 'random_restore', 'full_recovery', 'database_integrity',
-        'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions',
+        'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions', 'platform_validation',
     ];
 
     /**
@@ -55,6 +55,12 @@ final class Constants
             'details' => 'Looks at the latest successful backup recorded for the job and fails if it is older than expected. With a schedule on the job, the allowance is one and a half times the interval between runs plus two hours; without one it is 36 hours (BMS_RECOVERY_POINT_MAX_AGE_HOURS). It works for every backup method, including platforms such as Acronis. It confirms a backup ran and finished recently, not that its data is good: combine it with a restore test.',
             'runs' => 'In BMS, using the recorded backup results. No agent needed.',
         ],
+        'platform_validation' => [
+            'title' => 'Acronis validation',
+            'summary' => 'Confirms Acronis\'s own validation of the backup passed.',
+            'details' => 'Acronis can validate a backup itself, checking the backup archive is intact. BMS reads Acronis\'s records of those validation runs and judges each device by its newest run: it passes when every backup validated in that run is ok. A run that errors because Acronis could not open the backup (a wrong credential or archive password) is reported as access denied, not as damage, because the backup has not been confirmed either way. A device with no validation plan is skipped, never passed, and one whose validation stopped running fails. Acronis does the validating, not BMS: BMS only reads the result, so a validation plan has to be set up in Acronis. This checks the archive is intact, not that a restore works or a server would boot, so keep a restore test too. It applies to Acronis backups only.',
+            'runs' => 'In Acronis (the validation itself). BMS only reads the result, no agent needed.',
+        ],
         'database_integrity' => [
             'title' => 'Database integrity',
             'summary' => 'Restores a database backup to a scratch instance and runs its integrity checks.',
@@ -82,7 +88,7 @@ final class Constants
     public const FILESYSTEM_METHODS = self::LOCATION_METHODS;
 
     /** Test types the engine can actually run today. Everything else is recorded as skipped, never as a pass. */
-    public const ENGINE_TEST_TYPES = ['random_restore', 'synthetic_file', 'full_recovery', 'file_permissions', 'recovery_point'];
+    public const ENGINE_TEST_TYPES = ['random_restore', 'synthetic_file', 'full_recovery', 'file_permissions', 'recovery_point', 'platform_validation'];
 
     public const REPORT_TYPES = ['compliance', 'sla', 'security', 'dr_readiness'];
 

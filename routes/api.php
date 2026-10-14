@@ -4,6 +4,7 @@ use App\Http\Controllers\AgentController;
 use App\Http\Controllers\AgentsController;
 use App\Http\Controllers\AuditController;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\BackupFailureController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\IntegrationController;
 use App\Http\Controllers\JobController;
@@ -99,6 +100,8 @@ Route::middleware(['auth:sanctum', 'tenant', 'mfa', 'throttle:api'])->group(func
         Route::post('/{id}/test', [JobController::class, 'queueTest'])->middleware('permission:tests:run')->whereNumber('id');
     });
 
+    Route::get('/backup-failures', [BackupFailureController::class, 'index'])->middleware('permission:jobs:read');
+    Route::post('/backup-failures/{id}/resolve', [BackupFailureController::class, 'resolve'])->middleware('permission:failures:resolve')->whereNumber('id');
     Route::get('/test-types', [TestScheduleController::class, 'types'])->middleware('permission:tests:read');
     Route::get('/test-settings', [TestSettingsController::class, 'index'])->middleware('permission:tests:read');
     Route::put('/test-settings', [TestSettingsController::class, 'update'])->middleware('permission:tests:configure');

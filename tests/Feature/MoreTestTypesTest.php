@@ -264,7 +264,7 @@ class MoreTestTypesTest extends TestCase
     public function test_the_help_text_names_where_each_test_runs_and_is_honest_about_the_unbuilt_ones(): void
     {
         $types = collect($this->admin->get('/api/test-types')->json('data'))->keyBy('type');
-        $this->assertCount(5, $types->where('automated', true));
+        $this->assertCount(6, $types->where('automated', true));
         foreach ($types as $t) {
             $this->assertNotSame('', $t['runs']);
         }

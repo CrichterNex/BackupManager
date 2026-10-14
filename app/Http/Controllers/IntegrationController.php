@@ -10,6 +10,7 @@ use App\Services\Integrations\AcronisClient;
 use App\Services\Integrations\IntegrationException;
 use App\Services\Integrations\IntegrationImport;
 use App\Services\Integrations\IntegrationSync;
+use App\Services\PlatformWorkloads;
 use App\Support\ApiException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -24,7 +25,7 @@ class IntegrationController extends Controller
 
     private function present(Integration $i): array
     {
-        return [...$i->toArray(), 'links' => $i->links()->count()];
+        return [...$i->toArray(), 'links' => $i->links()->count(), 'workloads' => PlatformWorkloads::forIntegration($i)];
     }
 
     private function guard(callable $fn): mixed
@@ -129,6 +130,8 @@ class IntegrationController extends Controller
         $i = $this->find($id);
         $linked = ServerLink::where('integration_id', $i->id)->pluck('server_id', 'external_id');
         $devices = $this->guard(fn () => (new AcronisClient($i))->listMachines());
+        // Microsoft 365 backups are not devices: each kind (mailboxes, OneDrive, Teams, SharePoint) is offered as one, once its backups have been read.
+        $workloads = collect(array_keys(PlatformWorkloads::LABELS))->map(fn ($w) => PlatformWorkloads::asDevice($i, $w))->filter()->values();
 
         $byHostname = Server::where('active', true)->pluck('id', 'hostname')->mapWithKeys(fn ($sid, $h) => [strtolower($h) => $sid]);
 
@@ -138,8 +141,11 @@ class IntegrationController extends Controller
             // For the import dialog: does it have a plan, what would the server be called, and is that name already taken.
             'protected' => IntegrationImport::isProtected($d),
             'suggested_hostname' => ($h = IntegrationImport::hostnameFor($d['name'])),
-            'matches_server_id' => $h ? ($byHostname[strtolower($h)] ?? null) : null,
-        ])->sortBy('name')->values()]);
+            'matches_server_id' => $h ? ($byHostname[strtolower($h)] ?? null) : null, 'workload' => false,
+        ])->merge($workloads->map(fn ($d) => [
+            'id' => $d['id'], 'name' => $d['name'].' (all items)', 'status' => $d['status'], 'plans' => $d['plans'], 'last_success_at' => $d['last_success_at']?->toIso8601ZuluString(),
+            'linked_server_id' => $linked[$d['id']] ?? null, 'protected' => false, 'suggested_hostname' => null, 'matches_server_id' => null, 'workload' => true,
+        ]))->sortBy('name')->values()]);
     }
 
     /**
@@ -191,8 +197,10 @@ class IntegrationController extends Controller
             if ($other = ServerLink::where('integration_id', $integration->id)->where('external_id', $b['external_id'])->first()) {
                 throw ApiException::conflict('LINK_002', 'That device is already linked to another server.');
             }
-            $device = collect($this->guard(fn () => (new AcronisClient($integration))->listMachines()))->firstWhere('id', $b['external_id'])
-                ?? throw ApiException::badRequest('That device was not found on the platform.');
+            $device = PlatformWorkloads::isWorkloadId($b['external_id'])
+                ? (PlatformWorkloads::asDevice($integration, PlatformWorkloads::workloadOf($b['external_id'])) ?? throw ApiException::badRequest('No backups of that kind have been read from the platform yet. Wait for the next sync.'))
+                : (collect($this->guard(fn () => (new AcronisClient($integration))->listMachines()))->firstWhere('id', $b['external_id'])
+                    ?? throw ApiException::badRequest('That device was not found on the platform.'));
             $l = ServerLink::create(['server_id' => $server->id, 'integration_id' => $integration->id, 'external_id' => $device['id'], 'external_name' => $device['name']]);
             Audit::log($request, 'server_linked', 'server', $server->id, ['integration' => $integration->name, 'device' => $device['name']]);
 

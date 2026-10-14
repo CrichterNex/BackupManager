@@ -2,13 +2,16 @@
 
 namespace App\Services\Engine;
 
+use App\Models\BackupFailure;
 use App\Models\BackupJob;
 use App\Models\BackupTestExecution;
 use App\Models\BackupTestFailure;
 use App\Models\Company;
+use App\Models\Server;
 use App\Services\Agents\AgentService;
 use App\Services\CompanyTests;
 use App\Services\Integrations\IntegrationSync;
+use App\Services\PlatformValidation;
 use App\Services\Reports\ReportService;
 use App\Services\TestResults;
 use App\Services\TestScheduling;
@@ -191,6 +194,13 @@ final class Engine
 
                     continue;
                 }
+                // Read from what Acronis says about its own validation, so it works with no agent and no access to the backups.
+                if ($t['test_type'] === 'platform_validation') {
+                    $out = $t['backup_method'] === 'acronis' ? PlatformValidation::evaluate($t['server_id']) : ['skip' => 'Acronis validation applies to Acronis backups only.'];
+                    isset($out['skip']) ? TestResults::skip($t['id'], $out['skip']) : TestResults::record($t['id'], $out);
+
+                    continue;
+                }
                 if ($reason = self::unsupportedReason($t)) {
                     TestResults::skip($t['id'], $reason);
 
@@ -254,7 +264,22 @@ final class Engine
                 );
             }
 
-            return $due->count();
+            // Backup failures nobody has reviewed are chased the same way.
+            $backupDue = BackupFailure::where('resolved', false)->whereIn('severity', ['critical', 'high'])
+                ->where(fn ($q) => $q->where(fn ($a) => $a->where('escalation_level', '<', 1)->where('first_seen_at', '<=', $four))
+                    ->orWhere(fn ($b) => $b->where('escalation_level', '<', 2)->where('first_seen_at', '<=', $eight)))->get();
+            foreach ($backupDue as $f) {
+                $level = $f->first_seen_at <= $eight ? 2 : 1;
+                $f->forceFill(['escalation_level' => $level])->save();
+                TestResults::notifyRoles(
+                    ['company_admin', 'company_manager'], 'failure_escalated',
+                    "Escalation level $level: backup problem not reviewed",
+                    (Server::find($f->server_id)?->hostname ?? 'A server').": a {$f->kind} backup problem has not been reviewed for ".($level === 2 ? '8' : '4').' hours.',
+                    'backup_failure', $f->id,
+                );
+            }
+
+            return $due->count() + $backupDue->count();
         });
     }
 

@@ -149,6 +149,7 @@ its name, because one server can have several (Acronis, Robocopy, Rsync, Windows
 | Full read-back | Every file in the backup can be read from start to end. It restores nothing and does not show a server would boot. It reads all the data, so schedule it weekly or monthly. It has its own time limit (`full_read_timeout_seconds` on the restore-test action, 4 hours by default). | Agent only |
 | File permissions | Mode, owner and group (Linux) or the read-only, hidden and system flags (Windows) match on up to ten sampled files. Windows ACLs are not compared and the built-in robocopy does not copy them. Skipped, not passed, if the job has no layout or no sampled file has a source the agent may read. | Agent only |
 | Recovery point | A successful backup exists and is recent enough: one and a half schedule intervals plus two hours, or `BMS_RECOVERY_POINT_MAX_AGE_HOURS` (36) when the job has no schedule. Works for every method including Acronis, each method checked on its own. It does not check the data. | BMS, no agent |
+| Acronis validation | The validation itself runs in Acronis, never in BMS: set up a validation plan there. BMS reads Acronis's validation runs (and the server page shows whether a plan is confirmed, meaning Acronis has run a validation for the device; Acronis's policy list does not name validation plans, so activity is the proof). It reads (kept by each Acronis sync) and judges a device by its newest run: it passes when the backups validated in that run are all ok. If Acronis could not open the backup (a wrong credential or archive password) it fails as access denied, medium, and says the backup is not confirmed either way; it is not reported as damage. Damage codes fail as corruption, critical. No validation at all is skipped, never passed, and validation that has not started within `BMS_PLATFORM_VALIDATION_MAX_AGE_HOURS` (72) fails. It proves the archive is intact, not that a restore works. Acronis backups only. Needs the engine (`php artisan schedule:work`) running so the sync keeps reading. Replication is kept but not used yet, because Acronis reports it per vault, not per device. | BMS, no agent |
 
 ### Which tests a company uses
 Not every company has every backup solution, so tests can be limited per company, by two different people:
@@ -359,6 +360,15 @@ device from the server's page (**Link to platform device**, picked from the plat
 Other platforms (Veeam, Commvault, Microsoft 365, AWS, Azure) are not built. Each would be another adapter behind the
 same connection and link model.
 
+### Microsoft 365 backups in Acronis
+Microsoft 365 backups are not devices. Acronis logs one backup per mailbox, OneDrive, Team and SharePoint site, thousands a day, so a connection to the tenant that holds them (add it as its own connection, with an API client made in that tenant) is read from Acronis's activity log. BMS keeps each item's latest result and shows one summary per kind of workload: Microsoft 365 mailboxes, OneDrive, Microsoft Teams and SharePoint sites. The summaries are on the Integrations page, and on a server once it is linked to one: choose "Microsoft Teams (all items)" and so on in the link list, which offers a kind once its backups have been read.
+
+* A workload is **failed** when at least `BMS_WORKLOAD_FAILED_PERCENT` (5) of its items failed in their latest backup, or none succeeded. That raises a problem to review, with the error codes. A few failed items below that are shown in the summary and the server page (by name, with the error) but do not fail the workload, because in thousands of items some always fail, a deleted site for one. A cancelled backup is not a failure.
+* It is a **warning** (raised as overdue) when nothing in it has been backed up for the connection's stale hours.
+* Only items whose latest backup finished within `BMS_WORKLOAD_WINDOW_DAYS` (7) are counted. A mailbox is named only while its latest backup has a problem.
+* The first read of a connection starts `BMS_ACTIVITY_LOOKBACK_DAYS` (7) back and takes several syncs on a busy tenant. While it catches up the page says so, and an old last backup is not judged.
+* This shows Acronis ran the backups and how they ended. It does not show an item restores: keep the manual mailbox restore test. Needs the engine (`php artisan schedule:work`) running.
+
 ## Two-step sign-in (MFA)
 
 Everyone must sign in with a password and a 6-digit code from an authenticator app (Microsoft Authenticator, Google Authenticator, Authy and similar). It is on by default. Set `BMS_MFA_REQUIRED=false` in `.env` to make it optional, in which case people can still turn it on for themselves from their profile.
@@ -368,6 +378,27 @@ Everyone must sign in with a password and a 6-digit code from an authenticator a
 - **How it is protected.** Secrets are encrypted with `APP_KEY`. Recovery codes are stored as keyed hashes, so nobody can read them back. A code can only be used once, a wrong guess is limited per sign-in attempt, per person and per address, and the pending sign-in expires after five minutes.
 - **Scripts.** A login call now returns `mfa_required` and an `mfa_token`, and no session. Finish with `POST /api/auth/mfa/verify` and either `code` or `recovery_code`. Anything that logs in with a bare username and password will stop working, so give automation its own plan before you switch this on.
 - **Limit.** This is a code that can be phished like any other; it stops password reuse and guessing, not a convincing fake login page.
+
+## Backup problems to review
+A failed backup used to raise an alert and nothing more. Now every backup problem becomes an item someone has to **review**, on the
+Backups page and counted on the dashboard.
+
+- **What opens one**, worst first: a backup that **failed**; a device its platform calls **critical** (Acronis can say so even when the
+  last run succeeded); a backup that is **overdue**; or a platform **warning**. Agent backups that fail, expire or are lost open one too.
+  One item per server, source and backup type at a time: a problem that lasts is one item, not one per sync.
+- **It stays open until a person reviews it**, even if the backup recovers by itself, with what they found and what was done (required,
+  and in the audit log). Admins and technicians on that server can review; managers can read.
+- **A recovery does not erase the gap.** When the problem clears, BMS counts the scheduled backups that were skipped, using the job's
+  schedule or the usual gap between that device's successes (a day if nothing says otherwise), and the hours without a good backup.
+  Two daily backups skipped over 48 hours and then one success is *recovered, 2 missed*, never a clean recovery. The dashboard shows
+  missed backups next to ok and failed, and reviewing an item does not un-miss them.
+- **There is no grace period for a failure to be flagged.** An overdue backup is flagged after the integration's stale-after hours.
+- **No nagging, no hiding.** A problem someone reviewed that is still there is not raised again, unless it gets worse (for example overdue
+  becomes failed) or clears and comes back. A problem that comes back before anyone reviewed the last one reopens the same item.
+- **Unreviewed high-severity items escalate** to admins and managers after 4 and again after 8 hours, like test failures.
+- `php artisan bms:backup-failures-refresh` opens items for problems already recorded by the last Acronis sync.
+- **Needs the engine.** The Acronis sync only runs while `php artisan schedule:work` (or the cron entry) runs. If it is not running, the
+  data ages, and devices will look overdue because nothing has refreshed them.
 
 ## Reports
 
