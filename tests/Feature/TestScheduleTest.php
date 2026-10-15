@@ -75,7 +75,7 @@ class TestScheduleTest extends TestCase
         }
         $this->assertTrue($types->firstWhere('type', 'random_restore')['automated']);
         $notRun = $types->where('automated', false);
-        $this->assertEqualsCanonicalizing(['database_integrity', 'incremental_chain', 'm365_mailbox'], $notRun->pluck('type')->all());
+        $this->assertEqualsCanonicalizing(['database_integrity', 'incremental_chain', 'm365_mailbox', 'onedrive_file', 'sharepoint_site', 'teams_channel'], $notRun->pluck('type')->all());
         foreach ($notRun as $t) {
             $this->assertStringContainsString('skipped', $t['details'], $t['type'].' must not claim to run');
         }

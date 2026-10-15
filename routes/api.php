@@ -12,9 +12,13 @@ use App\Http\Controllers\LocationController;
 use App\Http\Controllers\ManualTestController;
 use App\Http\Controllers\MfaController;
 use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\PlatformBackupController;
 use App\Http\Controllers\PlatformCompanyController;
+use App\Http\Controllers\PlatformDashboardController;
 use App\Http\Controllers\PlatformUserController;
+use App\Http\Controllers\ReminderController;
 use App\Http\Controllers\ReportController;
+use App\Http\Controllers\ReportScheduleController;
 use App\Http\Controllers\ServerAgentController;
 use App\Http\Controllers\ServerController;
 use App\Http\Controllers\TestController;
@@ -66,6 +70,7 @@ Route::middleware(['auth:sanctum', 'tenant', 'mfa', 'throttle:api'])->group(func
     Route::put('/servers/{id}/agent/locations', [ServerAgentController::class, 'updateLocations'])->middleware('permission:agents:manage')->whereNumber('id');
     Route::put('/servers/{id}/agent/source-roots', [ServerAgentController::class, 'updateSourceRoots'])->middleware('permission:agents:manage')->whereNumber('id');
     Route::put('/servers/{id}/agent/credentials', [ServerAgentController::class, 'updateCredentials'])->middleware('permission:agents:manage')->whereNumber('id');
+    Route::post('/servers/{id}/agent/rotate', [ServerAgentController::class, 'rotate'])->middleware('permission:servers:write')->whereNumber('id');
     Route::delete('/servers/{id}/agent', [ServerAgentController::class, 'destroy'])->middleware('permission:servers:write')->whereNumber('id');
     // Backup locations for BMS-managed backups: everyone who can see jobs can see them, admins manage them.
     Route::get('/backup-locations', [LocationController::class, 'index'])->middleware('permission:jobs:read');
@@ -116,6 +121,7 @@ Route::middleware(['auth:sanctum', 'tenant', 'mfa', 'throttle:api'])->group(func
     Route::get('/manual-tests/{id}', [ManualTestController::class, 'show'])->middleware('permission:tests:read')->whereNumber('id');
     Route::get('/manual-tests/{id}/evidence/{evidenceId}/file', [ManualTestController::class, 'downloadFile'])->middleware('permission:tests:read')->whereNumber(['id', 'evidenceId']);
     Route::post('/backup-jobs/{jobId}/manual-test', [ManualTestController::class, 'store'])->middleware('permission:tests:run')->whereNumber('jobId');
+    Route::post('/servers/{serverId}/manual-test', [ManualTestController::class, 'storeForServer'])->middleware('permission:tests:run')->whereNumber('serverId');
     Route::put('/manual-tests/{id}/findings', [ManualTestController::class, 'saveFindings'])->middleware('permission:tests:run')->whereNumber('id');
     Route::post('/manual-tests/{id}/verify', [ManualTestController::class, 'verify'])->middleware('permission:tests:run')->whereNumber('id');
     Route::post('/manual-tests/{id}/request-verification', [ManualTestController::class, 'requestVerification'])->middleware('permission:tests:run')->whereNumber('id');
@@ -143,13 +149,25 @@ Route::middleware(['auth:sanctum', 'tenant', 'mfa', 'throttle:api'])->group(func
         Route::post('/', [ReportController::class, 'store'])->middleware('permission:reports:generate');
         Route::get('/{id}', [ReportController::class, 'show'])->middleware('permission:reports:read')->whereNumber('id');
         Route::get('/{id}/view', [ReportController::class, 'view'])->middleware('permission:reports:read')->whereNumber('id');
+        Route::get('/{id}/pdf', [ReportController::class, 'pdf'])->middleware('permission:reports:read')->whereNumber('id');
     });
+    Route::get('/report-schedules', [ReportScheduleController::class, 'index'])->middleware('permission:reports:read');
+    Route::post('/report-schedules', [ReportScheduleController::class, 'store'])->middleware('permission:reports:generate');
+    Route::put('/report-schedules/{id}', [ReportScheduleController::class, 'update'])->middleware('permission:reports:generate')->whereNumber('id');
+    Route::delete('/report-schedules/{id}', [ReportScheduleController::class, 'destroy'])->middleware('permission:reports:generate')->whereNumber('id');
+    Route::post('/report-schedules/{id}/run', [ReportScheduleController::class, 'run'])->middleware('permission:reports:generate')->whereNumber('id');
 
+    Route::get('/platform-backups', [PlatformBackupController::class, 'index'])->middleware('permission:jobs:read');
+    Route::get('/reminders', [ReminderController::class, 'show'])->middleware('permission:dashboard:read');
+    Route::put('/reminders', [ReminderController::class, 'update'])->middleware('permission:reminders:manage');
+    Route::put('/reminders/mine', [ReminderController::class, 'mine'])->middleware('permission:dashboard:read');
+    Route::post('/reminders/send-now', [ReminderController::class, 'sendNow'])->middleware('permission:dashboard:read');
     Route::get('/dashboard', [DashboardController::class, 'show'])->middleware('permission:dashboard:read');
     Route::get('/companies/{id}/dashboard', [DashboardController::class, 'forCompany'])->middleware('permission:dashboard:read')->whereNumber('id');
 
     // Platform admins only: the one place that works across companies.
     Route::middleware('platform')->prefix('platform')->group(function () {
+        Route::get('/dashboard', [PlatformDashboardController::class, 'index']);
         Route::get('/companies', [PlatformCompanyController::class, 'index']);
         Route::post('/companies', [PlatformCompanyController::class, 'store']);
         Route::get('/companies/{id}/test-settings', [PlatformCompanyController::class, 'testSettings'])->whereNumber('id');

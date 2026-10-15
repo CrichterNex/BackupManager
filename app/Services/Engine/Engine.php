@@ -12,6 +12,8 @@ use App\Services\Agents\AgentService;
 use App\Services\CompanyTests;
 use App\Services\Integrations\IntegrationSync;
 use App\Services\PlatformValidation;
+use App\Services\Reminders;
+use App\Services\Reports\ReportScheduling;
 use App\Services\Reports\ReportService;
 use App\Services\TestResults;
 use App\Services\TestScheduling;
@@ -292,17 +294,20 @@ final class Engine
         }
         try {
             $queued = self::scheduleDueTests();
-            $ran = $escalated = $expired = $backups = $synced = 0;
+            $ran = $escalated = $expired = $backups = $synced = $reminded = $reportsMade = 0;
             foreach (Company::where('is_active', true)->pluck('id') as $id) {
                 $queued += TestScheduling::runDue($id);
                 $ran += self::runDueTests($id);
                 $escalated += self::escalateFailures($id);
                 $expired += AgentService::expireStale($id);
+                AgentService::flagUnreachable($id);
                 $backups += AgentService::scheduleDueBackups($id);
                 $synced += IntegrationSync::runDue($id, config('bms.integration_sync_minutes'));
+                $reminded += Reminders::sendDue($id);
+                $reportsMade += ReportScheduling::runDue($id);
             }
 
-            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'expired' => $expired, 'backups' => $backups, 'synced' => $synced, 'reports' => ReportService::generateScheduled()];
+            return ['queued' => $queued, 'ran' => $ran, 'escalated' => $escalated, 'expired' => $expired, 'backups' => $backups, 'synced' => $synced, 'reminders' => $reminded, 'reports' => ReportService::generateScheduled() + $reportsMade];
         } finally {
             DB::select('SELECT RELEASE_LOCK(?)', [self::LOCK]);
         }

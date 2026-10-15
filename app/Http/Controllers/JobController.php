@@ -122,8 +122,11 @@ class JobController extends Controller
             'status' => ['sometimes', Rule::in(Constants::JOB_STATUSES)],
             'method' => ['sometimes', Rule::in(Constants::BACKUP_METHODS)],
             'server_id' => ['sometimes', 'integer', 'min:1'],
+            // Only the jobs BMS manages, leaving out the records it keeps of backups a platform reported.
+            'managed' => ['sometimes', 'boolean'],
         ]);
         $query = $this->base();
+        filter_var($q['managed'] ?? false, FILTER_VALIDATE_BOOLEAN) && $query->where('backup_jobs.is_record', false);
         isset($q['status']) && $query->where('backup_jobs.status', $q['status']);
         isset($q['method']) && $query->where('backup_jobs.backup_method', $q['method']);
         isset($q['server_id']) && $query->where('backup_jobs.server_id', $q['server_id']);

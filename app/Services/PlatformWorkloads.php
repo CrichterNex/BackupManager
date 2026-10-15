@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Integration;
 use App\Models\PlatformWorkloadItem;
+use App\Models\Server;
 use App\Models\ServerLink;
 use App\Services\Integrations\AcronisClient;
 use Carbon\CarbonImmutable;
@@ -54,7 +55,7 @@ final class PlatformWorkloads
             'company_id' => $integration->company_id, 'integration_id' => $integration->id, 'workload' => $workload, 'resource_id' => mb_substr(strtolower((string) ($a['resource']['id'] ?? '')), 0, 64),
             'plan_name' => mb_substr((string) ($a['policy']['name'] ?? ''), 0, 300) ?: null, 'result' => $result,
             'error_code' => $result === 'ok' ? null : (mb_substr((string) $code, 0, 100) ?: null), 'message' => $result === 'ok' ? null : (mb_substr((string) $message, 0, 300) ?: null),
-            'name' => $result === 'ok' ? null : (mb_substr((string) ($a['resource']['name'] ?? ''), 0, 255) ?: null),
+            'name' => mb_substr((string) ($a['resource']['name'] ?? ''), 0, 255) ?: null,
             'activity_uuid' => mb_substr((string) ($a['uuid'] ?? ''), 0, 40) ?: null, 'completed_at' => $time?->utc()->toDateTimeString(),
         ];
     }
@@ -92,6 +93,31 @@ final class PlatformWorkloads
             }
             DB::statement('INSERT INTO platform_workload_items ('.implode(', ', $cols).") VALUES $marks ON DUPLICATE KEY UPDATE $set", $values);
         }
+    }
+
+    /** The workload each Microsoft 365 test samples from. */
+    public const WORKLOAD_FOR_TEST = ['m365_mailbox' => 'mailbox', 'onedrive_file' => 'onedrive', 'sharepoint_site' => 'sharepoint', 'teams_channel' => 'teams'];
+
+    /**
+     * A mailbox, OneDrive or site picked at random from what Acronis has actually backed up, so the test proves the real backups and not a stand-in. Only
+     * an item whose latest backup succeeded is offered, since one that failed has nothing to restore. It avoids what this server was last tested on while
+     * there is anything else to choose. From the connection the server is linked to, else from any of the company's.
+     *
+     * @param  list<string>  $avoid
+     * @return array{name: string, connection: string}|null
+     */
+    public static function pick(Server $server, string $testType, array $avoid = []): ?array
+    {
+        $workload = self::WORKLOAD_FOR_TEST[$testType] ?? null;
+        if ($workload === null) {
+            return null;
+        }
+        $linked = ServerLink::where('server_id', $server->id)->where('external_id', self::PREFIX.$workload)->value('integration_id');
+        $q = fn () => PlatformWorkloadItem::where('workload', $workload)->whereIn('result', ['ok', 'warning'])->whereNotNull('name')
+            ->where('completed_at', '>=', now()->subDays((int) config('bms.workload_window_days')))->when($linked, fn ($x) => $x->where('integration_id', $linked));
+        $item = ($avoid ? $q()->whereNotIn('name', $avoid)->inRandomOrder()->first() : null) ?? $q()->inRandomOrder()->first();
+
+        return $item ? ['name' => $item->name, 'connection' => (string) Integration::find($item->integration_id)?->name] : null;
     }
 
     /** Forget items that have not been backed up for a month: gone from the tenant, and no longer something to count. */

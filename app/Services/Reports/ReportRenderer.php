@@ -21,6 +21,9 @@ final class ReportRenderer
         'insufficient_data' => ['Insufficient data', 'muted'],
     ];
 
+    /** Set for the duration of one render. When set, names are replaced by what the server does. */
+    private static ?Anonymiser $anon = null;
+
     private static function esc(mixed $v): string
     {
         return htmlspecialchars((string) ($v ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -68,7 +71,7 @@ final class ReportRenderer
 
     private static function kv(array $rows): string
     {
-        return '<dl>'.implode('', array_map(fn ($r) => '<div><dt>'.self::esc($r[0]).'</dt><dd>'.$r[1].'</dd></div>', $rows)).'</dl>';
+        return '<table class="kv">'.implode('', array_map(fn ($r) => '<tr><th>'.self::esc($r[0]).'</th><td>'.$r[1].'</td></tr>', $rows)).'</table>';
     }
 
     private static function section(string $title, string $body): string
@@ -90,7 +93,55 @@ final class ReportRenderer
     private static function signature(string $company): string
     {
         return self::section('Sign-off', '<p class="small">The figures above are calculated from records held in BMS for '.self::esc($company).'. This report is not an independent audit.</p>'
-            .'<div class="sign"><div>Prepared by<br><br>__________________________</div><div>Name and title<br><br>__________________________</div><div>Date<br><br>______________</div></div>');
+            .'<table class="sign"><tr><td>Prepared by<br><br>__________________________</td><td>Name and title<br><br>__________________________</td><td>Date<br><br>______________</td></tr></table>');
+    }
+
+    /** "Name" cell: the server's name, or what it stores when the report is anonymised. */
+    private static function serverCell(string $hostname, ?string $function): string
+    {
+        if (self::$anon) {
+            return self::esc(self::$anon->server($hostname));
+        }
+
+        return self::esc($hostname).($function ? '<div class="small muted">'.self::esc($function).'</div>' : '');
+    }
+
+    /** "Last test" and "Test performed by" cells, from a register row's last test. @return array{0: string, 1: string} */
+    private static function testCells(?array $t): array
+    {
+        if (! $t) {
+            return ['<span class="muted">Never tested</span>', '<span class="muted">No test</span>'];
+        }
+        $what = self::label($t['type']).' ('.self::esc($t['result'] === 'success' ? 'passed' : $t['result']).')<div class="small muted">'.self::date($t['at']).'</div>';
+        $by = match (true) {
+            $t['automatic'] => 'System (automatic)',
+            default => self::$anon ? self::$anon->person($t['by']) : ($t['by'] ?? 'Not recorded'),
+        };
+
+        return [$what, self::esc($by)];
+    }
+
+    /** One row for each server: what it stores, how often it is backed up, how long the backups are kept, and who last tested it. */
+    private static function register(array $s): string
+    {
+        $rows = $s['register'] ?? null;
+        if ($rows === null) {
+            return '';
+        }
+        $note = '<p class="small muted">Backup frequency is the job\'s schedule where it has one, otherwise worked out from recent backups and marked observed. The last test is the most recent one finished by the end of the period.</p>';
+        $rows = self::$anon ? self::$anon->sorted($rows) : $rows;
+
+        return self::section('Servers, backup frequency, retention and tests', $note.self::table(
+            self::$anon ? ['Server', 'Backup frequency', 'Retention', 'Last backup', 'Last test', 'Test performed by'] : ['Server', 'Stores', 'Backup frequency', 'Retention', 'Last backup', 'Last test', 'Test performed by'],
+            array_map(function ($r) {
+                [$test, $by] = self::testCells($r['last_test']);
+
+                return [
+                    self::serverCell($r['hostname'], null), ...(self::$anon ? [] : [$r['function'] ? self::esc($r['function']) : '<span class="muted">Not stated</span>']),
+                    self::esc($r['frequency']['text']), self::esc($r['retention']),
+                    self::date($r['last_backup_time']).($r['last_backup_status'] ? ' ('.self::esc($r['last_backup_status']).')' : ''), $test, $by,
+                ];
+            }, $rows), 'No active servers.'));
     }
 
     private static function compliance(array $s): string
@@ -123,6 +174,7 @@ final class ReportRenderer
                 ['Servers with a backup location recorded', self::esc($s['servers']['with_location']).' of '.self::esc($s['servers']['total'])],
                 ['Audit trail entries in period', self::esc($s['audit_entries'])],
             ])),
+            self::register($s),
             self::notMeasured($s['not_measured']),
         ]);
     }
@@ -142,6 +194,7 @@ final class ReportRenderer
             self::section('Incidents', self::table(['Severity', 'Raised', 'Resolved', 'Mean time to resolve'],
                 array_map(fn ($x) => [self::label($x['severity']), self::esc($x['raised']), self::esc($x['resolved']), self::val($x['mttr_hours'], ' hours')], $inc['by_severity']))
                 .'<p>Unresolved now: '.self::esc($inc['open_now']['critical']).' critical, '.self::esc($inc['open_now']['high']).' high, '.self::esc($inc['open_now']['medium']).' medium, '.self::esc($inc['open_now']['low']).' low.</p>'),
+            self::register($s),
             self::notMeasured($s['not_measured']),
         ]);
     }
@@ -171,47 +224,88 @@ final class ReportRenderer
                 ['Rule', 'Latest backup succeeded within '.self::esc($s['params']['max_backup_age_hours']).' hours, latest test passed within '.self::esc($s['params']['max_test_age_days']).' days, and no unresolved critical or high failures.'],
                 ['Last full recovery test', $s['last_full_recovery_test'] ? self::date($s['last_full_recovery_test']) : '<span class="muted">None recorded</span>'],
             ])),
-            self::section('Server readiness', self::table(['Server', 'OS', 'Backs up (as stated)', 'Last backup', 'Last test', 'Ready', 'Why not'],
-                array_map(fn ($v) => [
-                    self::esc($v['hostname']), self::esc($v['os_type']), isset($v['scope']) && $v['scope'] ? self::esc($v['scope']) : '<span class="muted">Not stated</span>',
-                    self::date($v['last_backup_time']).($v['last_backup_status'] ? ' ('.self::esc($v['last_backup_status']).')' : ''),
-                    self::date($v['last_test_time']).($v['last_test_status'] ? ' ('.self::esc($v['last_test_status']).')' : ''),
-                    self::badge($v['ready'] ? 'Yes' : 'No', $v['ready'] ? 'good' : 'bad'), self::esc(implode('; ', $v['reasons'])),
-                ], $s['servers']), 'No active servers.')),
+            self::section('Server readiness', self::table(self::$anon ? ['Server', 'OS', 'Backup frequency', 'Retention', 'Last backup', 'Last test', 'Test performed by', 'Ready', 'Why not'] : ['Server', 'Stores', 'OS', 'Backs up (as stated)', 'Backup frequency', 'Retention', 'Last backup', 'Last test', 'Test performed by', 'Ready', 'Why not'],
+                array_map(function ($v) {
+                    [$test, $by] = self::testCells($v['last_test'] ?? null);
+                    $anon = (bool) self::$anon;
+                    // Without a detailed last test (a report made before these columns existed) the plain last test is shown and nobody is named.
+                    $legacy = ! array_key_exists('last_test', $v);
+
+                    return [
+                        self::serverCell($v['hostname'], null), ...($anon ? [] : [($v['function'] ?? null) ? self::esc($v['function']) : '<span class="muted">Not stated</span>']),
+                        self::esc($v['os_type']), ...($anon ? [] : [isset($v['scope']) && $v['scope'] ? self::esc($v['scope']) : '<span class="muted">Not stated</span>']),
+                        self::esc($v['frequency'] ?? 'Not recorded'), self::esc($v['retention'] ?? 'Not recorded'),
+                        self::date($v['last_backup_time']).($v['last_backup_status'] ? ' ('.self::esc($v['last_backup_status']).')' : ''),
+                        $legacy ? self::date($v['last_test_time']).($v['last_test_status'] ? ' ('.self::esc($v['last_test_status']).')' : '') : $test, $legacy ? '<span class="muted">Not recorded</span>' : $by,
+                        self::badge($v['ready'] ? 'Yes' : 'No', $v['ready'] ? 'good' : 'bad'), self::esc(implode('; ', $v['reasons'])),
+                    ];
+                }, self::$anon ? self::$anon->sorted($s['servers']) : $s['servers']), 'No active servers.')),
             self::notMeasured($s['not_measured']),
         ]);
     }
 
     private const CSS = <<<'CSS'
-:root{--ink:#1f2933;--muted:#6b7785;--line:#d9dee4;--accent:#185fa5;--good:#0f6e56;--warn:#9a6700;--bad:#b42318}
-*{box-sizing:border-box}body{margin:0;background:#eef1f4;color:var(--ink);font:14px/1.55 system-ui,'Segoe UI',Arial,sans-serif}
-.page{max-width:900px;margin:24px auto;background:#fff;padding:48px;box-shadow:0 1px 8px rgba(0,0,0,.1)}
-header{border-bottom:3px solid var(--accent);padding-bottom:16px;margin-bottom:24px}
-h1{margin:0 0 4px;font-size:26px;color:var(--accent)}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);border-bottom:1px solid var(--line);padding-bottom:6px;margin:28px 0 12px}
-.sub{color:var(--muted)}.muted{color:var(--muted)}.small{font-size:12px}
-table{width:100%;border-collapse:collapse;margin:8px 0}th{text-align:left;background:#f4f6f8;border-bottom:2px solid var(--line)}th,td{padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
-dl{margin:8px 0}dl div{display:flex;gap:12px;padding:4px 0;border-bottom:1px dotted var(--line)}dt{width:260px;color:var(--muted);flex:none}dd{margin:0}
-.status{display:inline-block;font-size:18px;font-weight:700;padding:6px 16px;border-radius:999px;border:2px solid currentColor}
-.good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}
-.badge{display:inline-block;padding:1px 9px;border-radius:999px;border:1px solid currentColor;font-size:12px;font-weight:600}
-.sign{display:flex;gap:32px;margin-top:28px}.sign div{flex:1}
-@media print{body{background:#fff}.page{box-shadow:none;margin:0;padding:0;max-width:none}h2{break-after:avoid}table,section{break-inside:avoid}}
+*{box-sizing:border-box}body{margin:0;background:#eef1f4;color:#1f2933;font-family:'Segoe UI',Arial,sans-serif;font-size:14px;line-height:1.5}
+.page{max-width:1100px;margin:24px auto;background:#fff;padding:48px}
+header{border-bottom:3px solid #185fa5;padding-bottom:16px;margin-bottom:24px}
+h1{margin:0 0 4px;font-size:26px;color:#185fa5}h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#185fa5;border-bottom:1px solid #d9dee4;padding-bottom:6px;margin:28px 0 12px}
+.sub{color:#6b7785}.muted{color:#6b7785}.small{font-size:12px}
+table{width:100%;border-collapse:collapse;margin:8px 0}th{text-align:left;background:#f4f6f8;border-bottom:2px solid #d9dee4}th,td{padding:7px 9px;border-bottom:1px solid #d9dee4;vertical-align:top}
+table.kv th{width:260px;background:#fff;color:#6b7785;font-weight:normal;border-bottom:1px dotted #d9dee4}table.kv td{border-bottom:1px dotted #d9dee4}
+.status{display:inline-block;font-size:18px;font-weight:700;padding:6px 16px;border-radius:999px;border:2px solid #1f2933}
+.good{color:#0f6e56}.warn{color:#9a6700}.bad{color:#b42318}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;border:1px solid #1f2933;font-size:12px;font-weight:600}
+.notice{border:1px solid #9a6700;background:#fff8e6;padding:8px 12px;margin:0 0 16px}
+table.sign{margin-top:28px}table.sign td{border:0;width:33%;padding-right:24px}
+@media print{body{background:#fff}.page{margin:0;padding:0;max-width:none}h2{break-after:avoid}table,section{break-inside:avoid}}
 CSS;
 
-    public static function render(array $snap, int $reportId): string
+    /**
+     * @param  bool  $anonymise  replace the company, server and staff names, and withhold what a backup covers, so the report can be sent outside
+     * @param  bool  $pdf  a plainer page for the PDF engine, which has no use for a screen-sized page
+     */
+    public static function render(array $snap, int $reportId, bool $anonymise = false, bool $pdf = false): string
     {
         $type = $snap['type'];
+        self::$anon = $anonymise ? new Anonymiser(self::namedRows($snap)) : null;
+        try {
+            return self::page($snap, $reportId, $type, $pdf);
+        } finally {
+            self::$anon = null;
+        }
+    }
+
+    /** Every server row in a snapshot, so the anonymiser can give each one its label before anything is drawn. @return list<array<string, mixed>> */
+    private static function namedRows(array $snap): array
+    {
+        $rows = [];
+        // A compliance report keeps a count under 'servers', a readiness report a list, so only rows that are servers are taken.
+        foreach (array_merge($snap['register'] ?? [], $snap['servers'] ?? []) as $r) {
+            if (! is_array($r) || ! isset($r['hostname'])) {
+                continue;
+            }
+            $rows[] = ['hostname' => $r['hostname'], 'function' => $r['function'] ?? null, 'last_test' => $r['last_test'] ?? null];
+        }
+
+        return $rows;
+    }
+
+    private static function page(array $snap, int $reportId, string $type, bool $pdf): string
+    {
         $body = match ($type) {
             'compliance' => self::compliance($snap), 'sla' => self::sla($snap), 'security' => self::security($snap), default => self::dr($snap),
         };
         $period = $type === 'dr_readiness'
             ? 'As at '.self::date($snap['generated_at'])
             : self::day($snap['period']['from']).' to '.self::day(CarbonImmutable::parse($snap['period']['to'], 'UTC')->subSecond());
-        $company = $snap['company']['name'];
+        $company = self::$anon ? Anonymiser::COMPANY : $snap['company']['name'];
+        $anon = self::$anon !== null;
+        $notice = $anon ? '<p class="notice small">Anonymised for use outside the company: the organisation, servers and staff are not named. A server is shown by what it stores, and a person by a number. Dates, counts and results are as recorded.</p>' : '';
+        $ref = $anon ? 'Anonymised report' : 'Report '.self::esc($reportId);
 
         return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-            .'<title>'.self::esc(self::TITLES[$type]).' - '.self::esc($company).'</title><style>'.self::CSS.'</style></head><body><div class="page">'
-            .'<header><h1>'.self::esc(self::TITLES[$type]).'</h1><div>'.self::esc($company).'</div><div class="sub">'.$period.' · Report '.self::esc($reportId).' · Generated '.self::date($snap['generated_at']).'</div></header>'
-            .$body.self::signature($company).'</div></body></html>';
+            .'<title>'.($pdf ? '' : self::esc(self::TITLES[$type]).($anon ? '' : ' - '.self::esc($company))).'</title><style>'.self::CSS.($pdf ? 'body{background:#fff;font-family:"DejaVu Sans",Arial,sans-serif;font-size:10px}.page{margin:0;padding:0;max-width:none}h1{font-size:20px}' : '').'</style></head><body><div class="page">'
+            .'<header><h1>'.self::esc(self::TITLES[$type]).'</h1><div>'.self::esc($company).'</div><div class="sub">'.$period.' · '.$ref.' · Generated '.self::date($snap['generated_at']).'</div></header>'
+            .$notice.$body.self::signature($company).'</div></body></html>';
     }
 }

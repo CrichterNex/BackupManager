@@ -35,7 +35,8 @@ class DashboardController extends Controller
         return (int) round(($backupRate * 0.5 + $testRate * 0.5) * 100);
     }
 
-    private function build(Request $request): array
+    /** The figures for the current company. Used by the dashboard and, company by company, by the platform overview. */
+    public function summary(Request $request): array
     {
         $me = $request->user();
 
@@ -101,7 +102,7 @@ class DashboardController extends Controller
 
     public function show(Request $request)
     {
-        return response()->json(['success' => true, 'data' => $this->build($request)]);
+        return response()->json(['success' => true, 'data' => $this->summary($request)]);
     }
 
     // Spec path: refuses any company other than the caller's own.
@@ -111,6 +112,6 @@ class DashboardController extends Controller
             throw ApiException::forbidden('Access denied');
         }
 
-        return response()->json(['success' => true, 'data' => $this->build($request)]);
+        return response()->json(['success' => true, 'data' => $this->summary($request)]);
     }
 }

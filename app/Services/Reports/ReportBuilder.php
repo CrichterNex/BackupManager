@@ -337,11 +337,24 @@ final class ReportBuilder
         $targets = array_merge(self::DEFAULT_TARGETS, $opts['targets'] ?? []);
         $dr = array_merge(self::DEFAULT_DR, $opts['dr'] ?? []);
 
-        return $head + match ($type) {
+        $body = match ($type) {
             'compliance' => self::compliance($companyId, $from, $to, $targets),
             'sla' => self::sla($companyId, $from, $to, $targets),
             'security' => self::security($companyId, $from, $to),
             'dr_readiness' => self::dr($companyId, $dr),
         };
+        // What each server stores, how often it is backed up, how long backups are kept and who last tested it, as at the end of the period.
+        if (in_array($type, ['compliance', 'sla'], true)) {
+            $body['register'] = ServerRegister::build($companyId, $to);
+        }
+        if ($type === 'dr_readiness') {
+            $facts = collect(ServerRegister::build($companyId, CarbonImmutable::now('UTC')))->keyBy('hostname');
+            foreach ($body['servers'] as $i => $sv) {
+                $f = $facts[$sv['hostname']] ?? null;
+                $body['servers'][$i] += ['function' => $f['function'] ?? null, 'frequency' => $f['frequency']['text'] ?? 'Not known', 'retention' => $f['retention'] ?? 'Not set', 'last_test' => $f['last_test'] ?? null];
+            }
+        }
+
+        return $head + $body;
     }
 }

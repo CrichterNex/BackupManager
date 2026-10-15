@@ -39,6 +39,20 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg["verify_tls"])
         self.assertEqual(cfg["locations"], {})
 
+    def test_a_restore_test_with_no_locations_is_fine_when_bms_manages_them_and_refused_when_it_does_not(self):
+        # What the installer writes when a location is given, after that location has been moved out of the file and into BMS.
+        file_only = {"bms_url": "https://bms.example.com", "token": "bms_x", "actions": {"restore-test": {"type": "restore_test"}}, "locations": {}}
+        with self.assertRaises(agent.ConfigError) as e:
+            agent.validate_config(dict(file_only, actions={"restore-test": {"type": "restore_test"}}))
+        self.assertIn("restore_test needs a 'path'", str(e.exception))
+        managed = agent.validate_config(dict(file_only, remote_actions=True, actions={"restore-test": {"type": "restore_test"}}))
+        self.assertEqual(managed["locations"], {})
+        self.assertEqual(sorted(agent.effective_locations(dict(managed, _managed_locations={"vault": "/mnt/vault"}))), ["vault"])
+
+    def test_a_restore_test_with_a_path_or_with_locations_in_the_file_is_still_accepted(self):
+        agent.validate_config(self.good(actions={"restore-test": {"type": "restore_test", "path": "/mnt/backups"}}))
+        agent.validate_config(self.good(actions={"restore-test": {"type": "restore_test"}}, locations={"nas": "/mnt/nas"}))
+
     def test_http_is_refused_unless_allowed_for_testing(self):
         with self.assertRaises(agent.ConfigError):
             agent.validate_config(self.good(bms_url="http://bms.example.com"))
@@ -407,7 +421,7 @@ class ManagedActionTests(unittest.TestCase):
         c["_managed"] = agent.clean_managed({"backup": {"type": "command", "command": ["/b.sh", "--full"], "timeout_seconds": 600, "cwd": "/srv"}})
         a = agent.effective_actions(c)["backup"]
         self.assertEqual((a["command"], a["timeout_seconds"], a["cwd"]), (["/b.sh", "--full"], 600, "/srv"))
-        self.assertEqual(agent.advertised_actions(c), {"backup": {"type": "command", "timeout_seconds": 600}})
+        self.assertEqual(agent.advertised_actions(c)["backup"], {"type": "command", "timeout_seconds": 600})
 
     def test_an_unconfigured_default_never_hides_a_file_action_and_fails_clearly(self):
         c = self.cfg(actions={"backup": {"type": "command", "command": ["/file.sh"]}})
@@ -551,6 +565,280 @@ class BuiltinBackupTests(unittest.TestCase):
             self.assertEqual(agent.advertised_actions(self.cfg()), {"rsync": {"type": "rsync", "timeout_seconds": 8 * 3600}})
         finally:
             agent.builtin_available = real
+
+
+class MountTests(unittest.TestCase):
+    """A Linux agent mounts a location written as a share, with the login BMS holds, and then uses the mounted folder."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.calls = []
+
+    def runner(self, results):
+        """A stand-in for subprocess.run that returns the given (returncode, output) in turn and records what it was asked."""
+        results = list(results)
+
+        def run(cmd, env=None, **kw):
+            self.calls.append((cmd, dict(env or {})))
+            rc, out = results.pop(0) if results else (0, b"")
+            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=None)
+        return run
+
+    def mount(self, results=((0, b""),), **over):
+        kw = dict(mount_root=self.root, run=self.runner(results), which=lambda name: "/sbin/mount.cifs", is_root=True, tcp_open=lambda host: None)
+        kw.update(over)
+        return agent.mount_share("vault.example.com", "IT", "svc-backup", "S3cret!pw", **kw)
+
+    def test_share_paths_are_read_in_both_spellings(self):
+        self.assertEqual(agent.unc_parts("\\\\vault.example.com\\IT\\TestBkp\\sub"), ("vault.example.com", "IT", ["TestBkp", "sub"]))
+        self.assertEqual(agent.unc_parts("//vault.example.com/IT/TestBkp"), ("vault.example.com", "IT", ["TestBkp"]))
+        self.assertEqual(agent.unc_parts("//vault.example.com/IT"), ("vault.example.com", "IT", []))
+        for not_a_share in ("/mnt/vault/x", "IT/TestBkp", "C:\\Data", "", None, "//onlyhost"):
+            self.assertIsNone(agent.unc_parts(not_a_share), repr(not_a_share))
+
+    def test_the_share_is_mounted_privately_with_the_password_only_in_the_environment(self):
+        mp, why = self.mount()
+        self.assertIsNone(why)
+        self.assertEqual(mp, os.path.join(self.root, "vault.example.com_it"))
+        self.assertTrue(os.path.isdir(mp))
+        cmd, env = self.calls[0]
+        self.assertEqual(cmd[:3], ["/sbin/mount.cifs", "//vault.example.com/IT", mp])
+        self.assertEqual(env["PASSWD"], "S3cret!pw")
+        self.assertNotIn("S3cret!pw", " ".join(cmd), "never on a command line")
+        opts = cmd[cmd.index("-o") + 1]
+        for wanted in ("username=svc-backup", "vers=3.0", "uid=0", "gid=0", "file_mode=0600", "dir_mode=0700"):
+            self.assertIn(wanted, opts)
+        if os.name != "nt":
+            self.assertEqual(oct(os.stat(self.root).st_mode & 0o777), "0o700", "the folder holding mounts is private")
+
+    def test_older_smb_versions_are_tried_in_turn_until_one_works(self):
+        mp, why = self.mount([(1, b"mount error(95): Operation not supported"), (1, b"mount error(22): Invalid argument"), (0, b"")])
+        self.assertIsNone(why)
+        self.assertEqual([c[0][c[0].index("-o") + 1].split(",")[1] for c in self.calls], ["vers=3.0", "vers=2.1", "vers=2.0"])
+
+    def test_a_share_that_will_not_mount_says_why_and_never_shows_the_password(self):
+        mp, why = self.mount([(32, b"mount error(13): Permission denied. S3cret!pw was wrong")] * 4)
+        self.assertIsNone(mp)
+        self.assertIn("Could not mount", why)
+        self.assertIn("svc-backup", why)
+        self.assertIn("Permission denied", why)
+        self.assertNotIn("S3cret!pw", why)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "vault.example.com_it")), "the empty mount folder is removed again")
+
+    def test_a_wrong_password_stops_at_once_and_says_so_instead_of_trying_older_versions(self):
+        mp, why = self.mount([(32, b"mount error(13): Permission denied")] * 4)
+        self.assertEqual(len(self.calls), 1, "no other SMB version can fix a wrong password")
+        self.assertIn("refused the user name or password", why)
+        self.assertIn("SMB 3.0: mount error(13)", why)
+
+    def test_when_every_version_is_refused_each_answer_is_shown_with_what_to_check(self):
+        mp, why = self.mount([(32, b"mount error(112): Host is down\nRefer to the mount.cifs(8) manual page")] * 4)
+        self.assertEqual(len(self.calls), 4)
+        for vers in ("3.0", "2.1", "2.0", "1.0"):
+            self.assertIn("SMB %s: mount error(112): Host is down" % vers, why)
+        self.assertIn("refused every SMB version", why)
+        self.assertIn("dmesg", why)
+        self.assertNotIn("Refer to the mount.cifs", why, "only the first line of each answer is kept")
+
+    def test_an_unreachable_server_is_a_network_message_and_nothing_is_mounted(self):
+        mp, why = self.mount(tcp_open=lambda host: "timed out")
+        self.assertIsNone(mp)
+        self.assertIn("Cannot reach 'vault.example.com' on port 445", why)
+        self.assertIn("firewall", why)
+        self.assertEqual(self.calls, [])
+
+    def test_a_domain_in_the_user_name_is_passed_as_a_domain(self):
+        agent_user = "SABT\\crichter"
+        kw = dict(mount_root=self.root, run=self.runner([(0, b"")]), which=lambda name: "/sbin/mount.cifs", is_root=True, tcp_open=lambda host: None)
+        mp, why = agent.mount_share("vault.example.com", "IT", agent_user, "pw", **kw)
+        self.assertIsNone(why)
+        opts = self.calls[0][0][self.calls[0][0].index("-o") + 1]
+        self.assertIn("username=crichter", opts)
+        self.assertIn("domain=SABT", opts)
+        self.assertNotIn("SABT\\", opts)
+
+    def test_a_missing_share_name_stops_at_once(self):
+        mp, why = self.mount([(32, b"mount error(2): No such file or directory")] * 4)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("share name was not found", why)
+
+    def test_an_already_mounted_share_is_reused_without_mounting_again(self):
+        mounts = os.path.join(self.root, "mounts")
+        mp = os.path.join(self.root, "vault.example.com_it")
+        with open(mounts, "w") as f:
+            f.write("//vault.example.com/IT %s cifs rw 0 0\n" % mp)
+        self.assertTrue(agent.is_mounted(mp, mounts))
+        self.assertFalse(agent.is_mounted(mp + "x", mounts))
+        orig = agent.is_mounted
+        agent.is_mounted = lambda m, mounts_file=mounts: orig(m, mounts_file)
+        self.addCleanup(setattr, agent, "is_mounted", orig)
+        got, why = self.mount()
+        self.assertEqual((got, why), (mp, None))
+        self.assertEqual(self.calls, [])
+
+    def test_it_stops_with_a_clear_message_when_it_cannot_mount(self):
+        self.assertIn("needs the agent to run as root", self.mount(is_root=False)[1])
+        self.assertIn("cifs-utils", self.mount(which=lambda name: None)[1])
+        self.assertEqual(self.calls, [])
+
+    def test_names_that_could_smuggle_in_a_mount_option_are_refused(self):
+        for host, share in (("bad host", "IT"), ("h;rm", "IT"), ("h", "I,T"), ("h", "a\nb"), ("", "IT")):
+            self.assertIsNotNone(agent.mount_share(host, share, "u", "p", mount_root=self.root, run=self.runner([]), which=lambda n: "/sbin/mount.cifs", is_root=True)[1], (host, share))
+        for user in ("a,b=c", "u%pw"):
+            self.assertIsNotNone(agent.mount_share("h", "IT", user, "p", mount_root=self.root, run=self.runner([]), which=lambda n: "/sbin/mount.cifs", is_root=True)[1], user)
+        self.assertEqual(self.calls, [])
+
+    # --- through ensure_location_access, as a Linux machine
+
+    def cfg(self, location="\\\\vault.example.com\\IT\\TestBkp", managed=True, creds=True):
+        c = {"locations": {} if managed else {"vault": location}, "remote_actions": True, "_managed_locations": {"vault": location} if managed else {},
+             "_credentials": {"vault": {"username": "svc-backup", "password": "S3cret!pw"}} if creds else {}}
+        return c
+
+    def as_linux(self, mounted=("/var/x", None)):
+        real = agent.os.name
+        agent.os.name = "posix"
+        self.addCleanup(setattr, agent.os, "name", real)
+        seen = []
+        orig = agent.mount_share
+        agent.mount_share = lambda *a, **k: (seen.append(a), mounted)[1]
+        self.addCleanup(setattr, agent, "mount_share", orig)
+        return seen
+
+    def test_a_share_location_becomes_the_mounted_folder_below_it(self):
+        seen = self.as_linux(("/var/lib/bms-agent/mounts/vault_it", None))
+        c = self.cfg()
+        self.assertIsNone(agent.ensure_location_access(c, "vault"))
+        self.assertEqual(seen, [("vault.example.com", "IT", "svc-backup", "S3cret!pw")])
+        self.assertEqual(agent.effective_locations(c)["vault"], os.path.join("/var/lib/bms-agent/mounts/vault_it", "TestBkp"))
+        self.assertEqual(agent.declared_locations(c)["vault"], "\\\\vault.example.com\\IT\\TestBkp", "what BMS set is still what it is")
+
+    def test_a_location_that_is_already_a_local_folder_is_left_alone(self):
+        seen = self.as_linux()
+        c = self.cfg(location="/mnt/vault/TestBkp")
+        self.assertIsNone(agent.ensure_location_access(c, "vault"))
+        self.assertEqual(seen, [])
+        self.assertEqual(agent.effective_locations(c)["vault"], "/mnt/vault/TestBkp")
+
+    def test_without_a_sign_in_for_it_the_message_says_what_to_do_and_nothing_is_mounted(self):
+        seen = self.as_linux()
+        msg = agent.ensure_location_access(self.cfg(creds=False), "vault")
+        self.assertIn("no sign-in for it", msg)
+        self.assertIn("mount the share yourself", msg)
+        self.assertEqual(seen, [])
+
+    def test_a_mount_that_fails_is_the_failure_message(self):
+        self.as_linux((None, "Could not mount '\\\\vault.example.com\\IT' as svc-backup: Permission denied"))
+        self.assertIn("Permission denied", agent.ensure_location_access(self.cfg(), "vault"))
+
+    def test_the_config_file_overriding_bms_is_said_out_loud(self):
+        c = {"locations": {"vault": "IT/TestBkp"}, "remote_actions": True, "_managed_locations": {"vault": "\\\\vault.example.com\\IT\\TestBkp"}}
+        note = agent.config_override_note(c, "vault")
+        self.assertIn("config file overrides", note)
+        self.assertIn("IT/TestBkp", note)
+        self.assertEqual(agent.config_override_note({"locations": {"vault": "/a"}, "remote_actions": True, "_managed_locations": {"vault": "/a"}}, "vault"), "")
+        self.assertEqual(agent.config_override_note({"locations": {"vault": "/a"}, "remote_actions": False, "_managed_locations": {"vault": "/b"}}, "vault"), "")
+        self.assertEqual(agent.config_override_note({"locations": {}, "remote_actions": True, "_managed_locations": {"vault": "/b"}}, "vault"), "")
+
+
+class BuiltinRestoreTestTests(unittest.TestCase):
+    """The restore test is offered by the agent itself when it has locations to read, like the built-in rsync and robocopy."""
+
+    def cfg(self, **over):
+        c = {"bms_url": "https://bms.example.com", "token": "bms_x", "actions": {}, "locations": {}, "remote_actions": False, "poll_seconds": 30, "source_roots": []}
+        c.update(over)
+        return c
+
+    def test_an_agent_with_bms_managed_locations_offers_a_restore_test_with_nothing_in_its_file(self):
+        c = self.cfg(remote_actions=True, _managed_locations={"vault": "/mnt/vault/TestBkp"})
+        acts = agent.effective_actions(c)
+        self.assertEqual(acts["restore-test"], {"type": "restore_test"})
+        adv = agent.advertised_actions(c)["restore-test"]
+        self.assertEqual(adv["type"], "restore_test")
+        self.assertIn("random_restore", adv["tests"])
+
+    def test_an_agent_with_locations_in_its_file_offers_one_too(self):
+        self.assertIn("restore-test", agent.effective_actions(self.cfg(locations={"nas": "/mnt/nas"})))
+
+    def test_an_agent_with_no_locations_anywhere_does_not_offer_one(self):
+        self.assertNotIn("restore-test", agent.effective_actions(self.cfg()))
+        self.assertNotIn("restore-test", agent.effective_actions(self.cfg(remote_actions=True)), "until BMS has given it a location to read")
+
+    def test_one_defined_in_the_file_is_never_replaced_or_duplicated(self):
+        mine = {"type": "restore_test", "path": "/mnt/mine", "timeout_seconds": 99}
+        acts = agent.effective_actions(self.cfg(remote_actions=True, locations={"nas": "/mnt/nas"}, actions={"nightly-restore": mine}))
+        self.assertEqual([n for n, a in acts.items() if a["type"] == "restore_test"], ["nightly-restore"], "the file's own is the only one")
+        self.assertEqual(acts["nightly-restore"], mine)
+
+    def test_a_config_with_no_actions_and_remote_actions_on_is_valid_and_gets_one_once_bms_sends_a_location(self):
+        cfg = agent.validate_config({"bms_url": "https://bms.example.com", "token": "bms_x", "remote_actions": True})
+        self.assertNotIn("restore-test", agent.effective_actions(cfg))
+        cfg["_managed_locations"] = {"vault": "/mnt/vault"}
+        self.assertIn("restore-test", agent.effective_actions(cfg))
+
+
+class SmbDestinationTests(unittest.TestCase):
+    """rsync to a mounted SMB share: the share cannot take owners, permissions or symbolic links, so the backup is made without them."""
+
+    MOUNTS = "\n".join([
+        "/dev/sda1 / ext4 rw,relatime 0 0",
+        "//vault.example/IT /mnt/vault cifs rw,vers=3.0 0 0",
+        "//vault.example/Big\\040Share /mnt/big\\040share smb3 rw 0 0",
+        "/dev/sdb1 /mnt/vault/local-disk ext4 rw 0 0",
+        "tmpfs /run tmpfs rw 0 0",
+    ]) + "\n"
+
+    def mounts(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".mounts", delete=False)
+        f.write(self.MOUNTS)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    @unittest.skipIf(os.name == "nt", "reads Linux mount tables")
+    def test_the_file_system_is_the_one_of_the_longest_mount_that_holds_the_path(self):
+        m = self.mounts()
+        self.assertEqual(agent.filesystem_type("/mnt/vault/TestBkp/x", m), "cifs")
+        self.assertEqual(agent.filesystem_type("/mnt/vault", m), "cifs")
+        self.assertEqual(agent.filesystem_type("/mnt/vault/local-disk/data", m), "ext4", "a disk mounted inside the share is not the share")
+        self.assertEqual(agent.filesystem_type("/mnt/big share/backups", m), "smb3", "a space in a mount point is written as \\040 in /proc/mounts")
+        self.assertEqual(agent.filesystem_type("/home/u", m), "ext4")
+        self.assertEqual(agent.filesystem_type("/mnt/vaultx/oops", m), "ext4", "a folder that merely starts with the same letters is not inside the mount")
+
+    @unittest.skipIf(os.name == "nt", "reads Linux mount tables")
+    def test_a_path_whose_mounts_cannot_be_read_is_not_guessed_at(self):
+        self.assertIsNone(agent.filesystem_type("/mnt/vault", os.path.join(tempfile.gettempdir(), "no-such-mounts-file")))
+
+    def test_rsync_to_an_smb_share_leaves_out_what_the_share_cannot_hold(self):
+        for fs in ("cifs", "smb3"):
+            cmd = agent.build_backup_command("rsync", "/data/web", "/mnt/vault/web", ["/data/web/cache"], fs)
+            for wanted in ("-rt", "--no-perms", "--no-owner", "--no-group", "--modify-window=2", "--partial", "--exclude=/cache"):
+                self.assertIn(wanted, cmd, fs)
+            self.assertNotIn("-a", cmd, "archive mode would try to set owners, permissions and links")
+            self.assertNotIn("--delete", cmd)
+            self.assertEqual(cmd[-3:], ["--", "/data/web/", "/mnt/vault/web/"])
+
+    def test_every_other_destination_is_still_archive_mode(self):
+        for fs in (None, "ext4", "nfs4", "xfs"):
+            cmd = agent.build_backup_command("rsync", "/data/web", "/mnt/b/web", [], fs)
+            self.assertEqual(cmd[:3], ["rsync", "-a", "--partial"], fs)
+            self.assertNotIn("--no-perms", cmd)
+
+    def test_robocopy_is_not_changed_by_the_file_system(self):
+        self.assertEqual(agent.build_backup_command("robocopy", "C:\\Data", "D:\\B", [], "cifs")[:2], ["robocopy", "C:\\Data"])
+
+    @unittest.skipIf(os.name == "nt", "the hint is for Linux machines")
+    def test_a_location_that_is_really_an_smb_path_says_to_mount_it(self):
+        for path in ("IT/TestBkp", "//vault.example/IT/TestBkp", "smb://vault.example/IT", "\\\\vault.example\\IT"):
+            msg = agent.folder_problem(path, "the backup location folder")
+            self.assertIn("mount", msg, path)
+            self.assertIn("mount -t cifs", msg, path)
+            self.assertIn("Windows only", msg)
+
+    @unittest.skipIf(os.name == "nt", "the hint is for Linux machines")
+    def test_an_ordinary_missing_absolute_folder_does_not_get_the_mount_advice(self):
+        self.assertNotIn("mount -t cifs", agent.folder_problem("/mnt/definitely/not/here", "the backup location folder"))
 
 
 class ManagedLocationTests(unittest.TestCase):
@@ -722,9 +1010,7 @@ class CredentialTests(unittest.TestCase):
         c = self.cfg()
         self.assertIsNone(agent.ensure_location_access(c, "other"))
         self.assertIsNone(agent.ensure_location_access(self.cfg(remote=False), "vault"))
-        agent.os.name = "posix"
-        self.assertIsNone(agent.ensure_location_access(c, "vault"))
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, [], "no Windows sign-in was attempted for any of them")
 
     def test_a_local_folder_needs_no_sign_in(self):
         calls = self.patch([0])

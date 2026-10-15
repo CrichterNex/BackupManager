@@ -60,6 +60,22 @@ final class AgentService
 
     // --- queueing ---
 
+    /**
+     * A new secret for the server's agent, keeping everything set for it in BMS (its locations, source folders, share sign-ins and actions). The old secret
+     * stops working at once and anything the agent was doing is cancelled. Use this to reinstall an agent; removing and enrolling again would start from nothing.
+     *
+     * @return array{0: Agent, 1: string}
+     */
+    public static function rotateSecret(Server $server): array
+    {
+        $agent = Agent::where('server_id', $server->id)->first() ?? throw ApiException::notFound('Agent', 'AGENT_005');
+        $secret = 'bms_'.Str::random(40);
+        AgentCommand::where('agent_id', $agent->id)->whereIn('status', ['pending', 'running'])->update(['status' => 'cancelled', 'completed_at' => now(), 'output' => 'The agent\'s secret was replaced.']);
+        $agent->forceFill(['token_hash' => hash('sha256', $secret), 'last_seen_at' => null])->save();
+
+        return [$agent->refresh(), $secret];
+    }
+
     /** Queue a backup run for a job. Only one run per job at a time. */
     public static function queueBackup(BackupJob $job, ?int $userId, ?string $action = null): AgentCommand
     {
@@ -81,7 +97,8 @@ final class AgentService
             'agent_id' => $agent->id, 'type' => 'backup', 'action' => $name, 'backup_job_id' => $job->id,
             'requested_by' => $userId, 'deadline_at' => now()->addHours(self::BACKUP_DEADLINE_HOURS),
         ] + $job_part)->refresh();
-        $job->forceFill(['status' => 'running', 'started_time' => now(), 'completed_time' => null, 'status_message' => null])->save();
+        // Waiting, not running: it runs when the agent picks it up, which is when the status changes.
+        $job->forceFill(['status' => 'scheduled', 'started_time' => null, 'completed_time' => null, 'status_message' => 'Waiting for the agent to start it.'])->save();
 
         return $cmd;
     }
@@ -166,6 +183,9 @@ final class AgentService
             $cmd = AgentCommand::where('agent_id', $agent->id)->where('status', 'pending')->where('deadline_at', '>', now())
                 ->orderBy('id')->lockForUpdate()->first();
             $cmd?->forceFill(['status' => 'running', 'started_at' => now(), 'deadline_at' => now()->addSeconds(self::runLimitSeconds($agent, $cmd))])->save();
+            if ($cmd && $cmd->type === 'backup' && $cmd->backup_job_id) {
+                BackupJob::withoutGlobalScopes()->whereKey($cmd->backup_job_id)->update(['status' => 'running', 'started_time' => now(), 'status_message' => null]);
+            }
 
             return $cmd;
         });
@@ -287,6 +307,35 @@ final class AgentService
     }
 
     // --- engine housekeeping ---
+
+    /**
+     * A backup that has been waiting for an agent that is not checking in. The command can sit for hours before it expires, and until then nothing
+     * would say that the backup is not happening, so after a short grace a problem is raised to review. It is not raised while the agent is online
+     * (it may simply be busy with something else), and it clears itself when the backup later runs and succeeds. Returns how many are open.
+     */
+    public static function flagUnreachable(int $companyId): int
+    {
+        return CompanyContext::run($companyId, function () {
+            $grace = (int) config('bms.agent_pickup_grace_minutes');
+            $n = 0;
+            $waiting = AgentCommand::where('type', 'backup')->where('status', 'pending')->whereNotNull('backup_job_id')->where('created_at', '<=', now()->subMinutes($grace))->get();
+            foreach ($waiting as $cmd) {
+                $agent = Agent::find($cmd->agent_id);
+                $job = BackupJob::find($cmd->backup_job_id);
+                $server = $agent ? Server::find($agent->server_id) : null;
+                if (! $agent || ! $job || ! $server || $agent->isOnline()) {
+                    continue;
+                }
+                $seen = $agent->last_seen_at ? 'The agent last checked in at '.$agent->last_seen_at->utc()->format('Y-m-d H:i').' UTC' : 'The agent has never checked in';
+                BackupFailures::report($server, 'agent', $job->backup_method, 'failed',
+                    "$seen, so the backup queued at ".$cmd->created_at->utc()->format('Y-m-d H:i').' UTC has not started. Check that the agent is running on the server (on the Agents page it shows Offline).',
+                    $job->id, self::gapFor($job));
+                $n++;
+            }
+
+            return $n;
+        });
+    }
 
     /** Give up on commands nobody picked up (agent offline) or that never reported back, and say so. */
     public static function expireStale(int $companyId): int

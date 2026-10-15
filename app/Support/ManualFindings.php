@@ -37,9 +37,10 @@ final class ManualFindings
      * @param  array<string, mixed>|null  $selection  the item the test asked for
      * @param  int  $allowedHours  how old the recovery point may be
      */
-    public static function assertPassable(array $findings, ?array $selection, string $timezone, int $allowedHours, ?DateTimeImmutable $now = null): void
+    public static function assertPassable(array $findings, ?array $selection, string $timezone, int $allowedHours, ?DateTimeImmutable $now = null, string $testType = 'm365_mailbox'): void
     {
-        $fields = ManualChecklists::fields('m365_mailbox');
+        $noun = ['onedrive_file' => 'file', 'sharepoint_site' => 'document', 'teams_channel' => 'message'][$testType] ?? 'email';
+        $fields = ManualChecklists::fields($testType);
         $missing = [];
         foreach ($fields as $f) {
             if ($f['required'] && (! isset($findings[$f['id']]) || $findings[$f['id']] === '')) {
@@ -65,7 +66,7 @@ final class ManualFindings
                 throw ApiException::badRequest("You were asked for an item from {$selection['day']}. An item from a later day is not allowed.");
             }
             if ($sameDay && (int) $findings['position_used'] > (int) $selection['position']) {
-                throw ApiException::badRequest('You were asked for email number '.$selection['position'].' that day. A later one is not allowed.');
+                throw ApiException::badRequest("You were asked for $noun number ".$selection['position'].' that day. A later one is not allowed.');
             }
             if (! ($sameDay && $samePosition) && trim((string) ($findings['fallback_note'] ?? '')) === '') {
                 throw ApiException::badRequest('You were asked to open: '.$selection['text'].' If you used a different item, say why and what you used in the details.');
@@ -82,7 +83,10 @@ final class ManualFindings
             throw ApiException::badRequest("The recovery point you used is $age hours old, more than the $allowedHours hours allowed. Use the newest one. If there is no newer one, the backup is not keeping up: complete the test as failed.");
         }
         if ($findings['attachment'] === 'fails') {
-            throw ApiException::badRequest('An attachment that does not open is a failed restore. Complete the test as failed.');
+            throw ApiException::badRequest($noun === 'email' ? 'An attachment that does not open is a failed restore. Complete the test as failed.' : "A $noun that does not open, or is damaged, is a failed restore. Complete the test as failed.");
+        }
+        if (($findings['permissions'] ?? null) === 'lost') {
+            throw ApiException::badRequest('Permissions that were not restored are a failed restore. Complete the test as failed.');
         }
     }
 }

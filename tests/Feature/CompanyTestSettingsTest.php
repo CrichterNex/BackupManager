@@ -75,7 +75,7 @@ class CompanyTestSettingsTest extends TestCase
     public function test_a_company_with_no_settings_has_every_test(): void
     {
         $s = $this->settings($this->admin);
-        $this->assertCount(9, $s);
+        $this->assertCount(12, $s);
         foreach ($s as $row) {
             $this->assertTrue($row['available'] && $row['enabled'] && $row['active'], $row['type']);
             $this->assertNotSame('', $row['title']);
@@ -166,7 +166,7 @@ class CompanyTestSettingsTest extends TestCase
         $this->assertTrue($this->settings($this->otherAdmin)['recovery_point']['active'], 'another company is untouched');
         $this->platform->put('/api/platform/companies/999999/test-settings', ['tests' => ['random_restore' => false]])->assertStatus(404);
         $this->platform->put("/api/platform/companies/{$this->companyId}/test-settings", ['tests' => ['nonsense' => false]])->assertStatus(400);
-        $this->assertCount(9, $this->platform->get("/api/platform/companies/{$this->companyId}/test-settings")->assertOk()->json('data'));
+        $this->assertCount(12, $this->platform->get("/api/platform/companies/{$this->companyId}/test-settings")->assertOk()->json('data'));
     }
 
     public function test_a_platform_admins_change_is_in_the_companys_own_audit_trail(): void

@@ -46,10 +46,18 @@ final class IntegrationSync
 
         // Read the activity first, so the workload summaries used just below include what Acronis finished since the last sync.
         self::syncChecks($integration);
+        $tenants = [];
         foreach ($integration->links()->with('server')->get() as $link) {
-            PlatformWorkloads::isWorkloadId($link->external_id)
-                ? self::applyWorkload($integration, $link)
-                : self::apply($integration, $link, $devices->get($link->external_id));
+            if (PlatformWorkloads::isWorkloadId($link->external_id)) {
+                $tenants[$link->server_id]['server'] = $link->server;
+                $tenants[$link->server_id]['summaries'][] = self::applyWorkload($integration, $link);
+            } else {
+                self::apply($integration, $link, $devices->get($link->external_id));
+            }
+        }
+        // A Microsoft 365 tenant is several workloads, linked one by one. Its status is all of them together, so it is judged once, here.
+        foreach ($tenants as $t) {
+            self::judgeTenant($integration, $t['server'], $t['summaries']);
         }
         $integration->forceFill(['last_sync_at' => now(), 'last_sync_status' => 'ok', 'last_sync_error' => null])->save();
 
@@ -114,6 +122,7 @@ final class IntegrationSync
             $runAt = $state === 'failed' ? $d['last_run_at'] : $d['last_success_at'];
             if (! BackupJob::where('server_id', $server->id)->where('backup_method', 'acronis')->where('completed_time', $runAt)->exists()) {
                 BackupJob::create([
+                    'is_record' => true,
                     'server_id' => $server->id, 'backup_method' => 'acronis', 'status' => $state === 'failed' ? 'failed' : 'success',
                     'status_message' => "Reported by {$integration->name}".($d['status'] ? " (status: {$d['status']})" : ''),
                     'started_time' => null, 'completed_time' => $runAt,
@@ -126,34 +135,69 @@ final class IntegrationSync
         });
     }
 
-    /** A linked Microsoft 365 workload: the whole workload's latest backups add up to one status for the server. */
-    private static function applyWorkload(Integration $integration, ServerLink $link): void
+    /**
+     * A linked Microsoft 365 workload: record its summary on the link and keep a backup record for it. Returns the summary, or null when nothing
+     * has been read for it yet. The server's own status is judged from all its workloads together, in judgeTenant().
+     *
+     * @return array<string, mixed>|null
+     */
+    private static function applyWorkload(Integration $integration, ServerLink $link): ?array
     {
         $server = $link->server;
-        $workload = PlatformWorkloads::workloadOf($link->external_id);
-        $s = PlatformWorkloads::summary($integration, $workload);
+        $s = PlatformWorkloads::summary($integration, PlatformWorkloads::workloadOf($link->external_id));
         if ($s === null) {
             $link->forceFill(['sync_error' => 'No backups of this kind have been read from the platform yet. They appear after the next sync.', 'synced_at' => now()])->save();
 
-            return;
+            return null;
         }
         $link->forceFill(['external_name' => $s['label'], 'last_status' => $s['state'], 'last_run_at' => $s['last_run_at'], 'last_success_at' => $s['last_success_at'], 'synced_at' => now(), 'sync_error' => null])->save();
-        if ($s['state'] === 'unknown') {
-            return;
-        }
-        DB::transaction(function () use ($server, $s, $integration) {
+        if ($s['state'] !== 'unknown') {
             $failed = $s['state'] === 'failed';
             $runAt = $failed ? $s['last_run_at'] : $s['last_success_at'];
-            if ($runAt && ! BackupJob::where('server_id', $server->id)->where('backup_method', 'acronis_m365')->where('completed_time', $runAt)->exists()) {
-                BackupJob::create(['server_id' => $server->id, 'backup_method' => 'acronis_m365', 'status' => $failed ? 'failed' : 'success', 'started_time' => null, 'completed_time' => $runAt,
-                    'status_message' => "Reported by {$integration->name}: {$s['label']}, {$s['ok']} ok, {$s['warning']} with warnings, {$s['failed']} failed of {$s['items']} items"]);
+            if ($runAt) {
+                // A workload is many separate backups (one for each mailbox, site and so on), so its last success moves every few minutes. One record
+                // for each workload for each day, brought up to date as the day goes on, keeps the history readable and the backup counts honest.
+                $day = CarbonImmutable::parse($runAt)->utc()->toDateString();
+                $fields = ['status' => $failed ? 'failed' : 'success', 'completed_time' => $runAt,
+                    'status_message' => "Reported by {$integration->name}: {$s['label']}, {$s['ok']} ok, {$s['warning']} with warnings, {$s['failed']} failed of {$s['items']} items"];
+                $today = BackupJob::where('server_id', $server->id)->where('backup_method', 'acronis_m365')->where('platform_ref', $link->external_id)
+                    ->whereDate('completed_time', $day)->orderByDesc('id')->first();
+                $today ? $today->forceFill($fields)->save() : BackupJob::create($fields + ['is_record' => true, 'server_id' => $server->id, 'backup_method' => 'acronis_m365', 'platform_ref' => $link->external_id, 'started_time' => null]);
             }
-            Server::whereKey($server->id)->update(['last_backup_time' => $runAt, 'last_backup_status' => $s['state'], 'updated_at' => now()]);
-            $kind = match ($s['state']) {
+        }
+
+        return $s;
+    }
+
+    /**
+     * The status of a tenant from every workload linked to it. Failed if any workload failed, a warning if any has gone quiet, otherwise fine. Its last
+     * backup is when the oldest workload last succeeded (the whole tenant has been backed up since then), or, if one failed, when that last ran.
+     * One problem to review covers the tenant, naming each workload that is not fine.
+     *
+     * @param  list<array<string, mixed>|null>  $summaries
+     */
+    private static function judgeTenant(Integration $integration, Server $server, array $summaries): void
+    {
+        $known = array_values(array_filter($summaries, fn ($s) => $s !== null && $s['state'] !== 'unknown'));
+        if (! $known) {
+            return; // nothing read yet: do not invent a result
+        }
+        $failed = array_values(array_filter($known, fn ($s) => $s['state'] === 'failed'));
+        $quiet = array_values(array_filter($known, fn ($s) => $s['state'] === 'warning'));
+        $state = $failed ? 'failed' : ($quiet ? 'warning' : 'success');
+        $times = fn (string $k, array $list) => array_values(array_filter(array_map(fn ($s) => $s[$k], $list)));
+        $earliest = fn (array $t) => $t ? collect($t)->sortBy(fn ($x) => $x->getTimestamp())->first() : null;
+        $latest = fn (array $t) => $t ? collect($t)->sortByDesc(fn ($x) => $x->getTimestamp())->first() : null;
+        $lastGood = $earliest($times('last_success_at', $known));
+        $at = $failed ? $latest($times('last_run_at', $failed)) : $lastGood;
+        $bad = $failed ?: $quiet;
+        DB::transaction(function () use ($integration, $server, $state, $at, $lastGood, $bad) {
+            Server::whereKey($server->id)->update(['last_backup_time' => $at, 'last_backup_status' => $state, 'updated_at' => now()]);
+            $kind = match ($state) {
                 'failed' => 'failed', 'warning' => 'overdue', default => null
             };
-            BackupFailures::report($server, 'acronis', 'acronis_m365', $kind, $kind ? PlatformWorkloads::message($s, $integration) : null, null,
-                ['last_good_at' => $s['last_success_at'], 'back_at' => $s['last_success_at'], 'interval' => BackupFailures::intervalSeconds($server, 'acronis_m365')]);
+            BackupFailures::report($server, 'acronis', 'acronis_m365', $kind, $kind ? implode(' ', array_map(fn ($s) => PlatformWorkloads::message($s, $integration), $bad)) : null, null,
+                ['last_good_at' => $lastGood, 'back_at' => $lastGood, 'interval' => BackupFailures::intervalSeconds($server, 'acronis_m365')]);
         });
     }
 

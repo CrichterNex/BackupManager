@@ -17,7 +17,7 @@ final class Constants
 
     public const TEST_TYPES = [
         'synthetic_file', 'random_restore', 'full_recovery', 'database_integrity',
-        'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions', 'platform_validation',
+        'incremental_chain', 'm365_mailbox', 'recovery_point', 'file_permissions', 'platform_validation', 'onedrive_file', 'sharepoint_site', 'teams_channel',
     ];
 
     /**
@@ -76,10 +76,31 @@ final class Constants
         'm365_mailbox' => [
             'title' => 'Microsoft 365 mailbox',
             'summary' => 'Restores a sample mailbox item from a Microsoft 365 backup and checks it.',
-            'details' => 'BMS has no way to restore from a Microsoft 365 backup itself. A person does it by hand from the Tests page: BMS picks a mailbox from the tenant\'s list, the tester follows a checklist in the backup console and attaches the fingerprints, notes and screenshots as evidence. If it is queued for BMS to run, it is recorded as skipped, never as a pass.',
+            'details' => 'BMS has no way to restore from a Microsoft 365 backup itself. A person does it by hand from the Tests page: BMS picks a mailbox at random from those Acronis has backed up (or from the tenant\'s own list, if it has one), the tester follows a checklist in the backup console and attaches the fingerprints, notes and screenshots as evidence. If it is queued for BMS to run, it is recorded as skipped, never as a pass.',
+            'runs' => 'By a person, by hand.',
+        ],
+        'onedrive_file' => [
+            'title' => 'OneDrive file',
+            'summary' => 'Restores a sample file from a OneDrive backup and checks it opens.',
+            'details' => 'BMS cannot restore from a Microsoft 365 backup itself, and Acronis\'s records show that a OneDrive backup ran, not that a file comes back. A person does it by hand from the Tests page: BMS picks a OneDrive at random from those Acronis has backed up, so the test proves the real backups. BMS also names the file, as the Nth one last changed on a random weekday, so the tester cannot choose an easy one. The tester restores it to a different location in the backup console, checks it opens, and records its details and screenshots, which BMS checks against what it asked for. The tester only confirms the restored file opens and is the right size, and does not read what is in it. If it is queued for BMS to run, it is recorded as skipped, never as a pass.',
+            'runs' => 'By a person, by hand.',
+        ],
+        'teams_channel' => [
+            'title' => 'Microsoft Teams message',
+            'summary' => 'Restores a sample channel message from a Microsoft Teams backup and checks it.',
+            'details' => 'BMS cannot restore from a Microsoft 365 backup itself, and Acronis\'s records show that a Teams backup ran, not that a message comes back. A person does it by hand from the Tests page: BMS picks a team at random from those Acronis has backed up, so the test proves the real backups. BMS also names the message, as the Nth one posted on a random weekday in the General channel, so the tester cannot choose an easy one. The tester restores it to a different location in the backup console, checks it is complete and any file on it opens, and records its details and screenshots, which BMS checks against what it asked for. The tester only confirms the message is there and intact, and does not read the conversation. If it is queued for BMS to run, it is recorded as skipped, never as a pass.',
+            'runs' => 'By a person, by hand.',
+        ],
+        'sharepoint_site' => [
+            'title' => 'SharePoint site',
+            'summary' => 'Restores a document from a SharePoint site backup and checks it opens.',
+            'details' => 'BMS cannot restore from a Microsoft 365 backup itself, and Acronis\'s records show that a site backup ran, not that a document comes back. A person does it by hand from the Tests page: BMS picks a site at random from those Acronis has backed up, so the test proves the real backups. BMS also names the document, as the Nth one last changed on a random weekday, so the tester cannot choose an easy one. The tester restores it with its permissions to a different location in the backup console, checks it opens, and records its details and screenshots, which BMS checks against what it asked for. Restore to a different location, never over the live site. If it is queued for BMS to run, it is recorded as skipped, never as a pass.',
             'runs' => 'By a person, by hand.',
         ],
     ];
+
+    /** The tests for a Microsoft 365 tenant. They apply to tenants only, and a tenant needs no backup job of its own to be tested. */
+    public const M365_TEST_TYPES = ['m365_mailbox', 'onedrive_file', 'sharepoint_site', 'teams_channel'];
 
     /** Test types an agent can run on the server that holds the backup. */
     public const AGENT_TEST_TYPES = ['random_restore', 'synthetic_file', 'full_recovery', 'file_permissions'];

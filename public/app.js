@@ -28,8 +28,10 @@ const PAGES = [
   { id: 'reports', group: 'protection', title: 'Reports', render: reports, noTechnician: true },
   { id: 'users', group: 'admin', title: 'Users', render: users, admin: true },
   { id: 'integrations', group: 'infrastructure', title: 'Integrations', render: integrations, admin: true },
+  { id: 'overview', group: 'platform', title: 'All companies', render: overview, platform: true },
   { id: 'companies', group: 'platform', title: 'Companies', render: companies, platform: true },
   { id: 'people', group: 'platform', title: 'People', render: people, platform: true },
+  { id: 'reminders', group: 'admin', title: 'Mail reminders', render: reminders, admin: true },
   { id: 'audit', group: 'admin', title: 'Audit log', render: auditLog, admin: true },
   { id: 'profile', group: 'account', title: 'My profile', render: profile },
 ];
@@ -389,15 +391,16 @@ const serverFields = (s = {}) => [
   { name: 'timezone', label: 'Time zone of the backup console', value: s.timezone ?? (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'), hint: 'For example Africa/Johannesburg or UTC. Tests by hand pick a day in this zone and read the dates entered in it.' },
   { name: 'criticality', label: 'Criticality', type: 'select', options: opts(['standard', 'critical', 'non-critical']), value: s.criticality },
   { name: 'backup_methods', label: 'Backup methods', type: 'checks', options: opts(METHODS), value: s.backup_methods ?? [] },
+  { name: 'data_function', label: 'What this server stores or does', required: true, value: s.data_function ?? '', hint: 'For example Finance database, HR file shares or Domain controller. An anonymised report shows this in place of the server\u2019s name, so do not put the name or the company in it.' },
   { name: 'retention_policy_days', label: 'Retention (days)', type: 'number', value: s.retention_policy_days ?? '', hint: 'Leave empty to keep indefinitely' },
   { name: 'notes', label: 'Notes', type: 'textarea', value: s.notes ?? '' },
-  { name: 'test_targets', label: 'Test mailboxes or sites to sample (Microsoft 365 only)', type: 'textarea', value: (s.test_targets ?? []).join('\n'), hint: 'One per line. Use dedicated test mailboxes, never real people\u2019s, so nobody\u2019s mail is read and nobody has to give permission. Each test by hand samples one, the one tested least recently. A tenant has no IP address or agent and can only use the Microsoft 365 backup methods.' },
+  { name: 'test_targets', label: 'Test mailboxes or sites to sample (Microsoft 365 only)', type: 'textarea', value: (s.test_targets ?? []).join('\n'), hint: 'Optional, one per line. Leave it empty and BMS picks any mailbox, OneDrive or site Acronis has backed up (link the tenant to its Acronis connection first). Fill it in only to limit tests to these names. Each test by hand samples one, the one tested least recently. A tenant has no IP address or agent and can only use the Microsoft 365 backup methods.' },
   { name: 'reference_items', label: 'Reference items (Microsoft 365 only)', type: 'textarea', value: (s.reference_items ?? []).map((r) => `${r.label} | ${r.hash} | ${r.where ?? ''}`).join('\n'),
     hint: 'Known files kept in the test mailboxes, one per line: name | fingerprint | where it is. Work out each file\u2019s SHA-256 once when you create it. A tester then restores it and enters only the restored copy\u2019s fingerprint, and BMS compares it with this one, so nobody needs the original or the mailbox owner. The mailbox must be in the backup, and the item must exist in a recovery point.' },
 ];
 const serverBody = (v) => ({
   hostname: v.hostname.trim(), ip_address: v.ip_address.trim() || null, os_type: v.os_type, timezone: v.timezone.trim() || 'UTC', criticality: v.criticality,
-  backup_methods: v.backup_methods, retention_policy_days: v.retention_policy_days ? Number(v.retention_policy_days) : null, notes: v.notes.trim() || null,
+  backup_methods: v.backup_methods, retention_policy_days: v.retention_policy_days ? Number(v.retention_policy_days) : null, data_function: v.data_function.trim() || null, notes: v.notes.trim() || null,
   test_targets: v.os_type === 'microsoft_365' ? v.test_targets.split('\n').map((x) => x.trim()).filter(Boolean) : null,
   reference_items: v.os_type === 'microsoft_365' ? v.reference_items.split('\n').map((x) => x.trim()).filter(Boolean).map((line) => { const [label, hash, ...where] = line.split('|').map((p) => p.trim()); return { label, hash: hash ?? '', where: where.join(' | ') || null }; }) : null,
 });
@@ -419,7 +422,7 @@ async function serverDetail(s) {
     h('h2', {}, full.hostname),
     h('table', {}, h('tbody', {},
       row('Health', badge(full.status)), row('Type', full.os_type === 'microsoft_365' ? 'Microsoft 365 tenant' : label(full.os_type)), full.os_type !== 'microsoft_365' && row('IP', full.ip_address ?? '—'), row('Criticality', label(full.criticality)),
-      row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
+      row('Methods', full.backup_methods.map(label).join(', ') || '—'), row('Stores', full.data_function || '—'), row('Retention', full.retention_policy_days ? `${full.retention_policy_days} days` : 'Indefinite'),
       row('Last backup', `${label(full.last_backup_status)} · ${fmtDate(full.last_backup_time)}`), row('Last test', `${label(full.last_test_status)} · ${fmtDate(full.last_test_time)}`),
       row('Technicians', full.assigned_technicians.map((t) => t.username).join(', ') || 'None assigned'), full.os_type !== 'microsoft_365' && row('Agent', agentSummary(full.agent)), full.os_type === 'microsoft_365' && row('Test mailboxes', (full.test_targets ?? []).join(', ') || 'None listed: choose one each time'), full.os_type === 'microsoft_365' && row('Reference items', (full.reference_items ?? []).map((r) => r.label).join(', ') || 'None: tests check the item opens, with no original to compare'), row('Platforms', linksSummary(full.links)), (full.workloads ?? []).map((w) => workloadRow(row, w)), full.validation && full.links.length > 0 && row('Acronis validation', h('span', {}, h('strong', {}, full.validation.confirmed ? 'Plan confirmed' : 'No plan confirmed'), h('div', { class: 'small' }, full.validation.message))), row('Notes', full.notes ?? '—'))),
     h('div', { class: 'actions' },
@@ -430,6 +433,9 @@ async function serverDetail(s) {
       isAdmin() && full.os_type !== 'microsoft_365' && (full.agent.enrolled
         ? h('button', { onclick: async () => { if (await confirmModal('Remove agent?', `${full.hostname} will stop receiving backup and test commands. The agent software on the server keeps running until you stop it.`, 'Remove') && await act(() => api('DELETE', `/servers/${full.id}/agent`), 'Agent removed')) { overlay.remove(); show(); } } }, 'Remove agent')
         : h('button', { onclick: () => { overlay.remove(); enrollAgent(full); } }, 'Enroll agent')),
+      canRunTests() && h('button', { onclick: () => { overlay.remove(); manualTestForm({ server_id: full.id, hostname: full.hostname, backup_method: full.os_type === 'microsoft_365' ? 'acronis_m365' : '',
+        source: full.links.length > 0 ? `Backup status for this server is read from ${[...new Set(full.links.map((l) => `${l.integration.name} (${l.external_name ?? l.external_id})`))].join(', ')}. The restore itself is done by hand in the backup console.`
+          : 'No backup connection is linked to this server, so BMS has no backup status for it. The test is done wholly by hand in the backup console, and needs no backup job.' }); } }, 'Test by hand'),
       isAdmin() && h('button', { onclick: () => { overlay.remove(); linkForm(full); } }, 'Link to platform device'),
       isAdmin() && full.links.length > 0 && h('button', { onclick: async () => {
         if (await confirmModal('Remove platform link?', 'BMS will stop reading backup status for this server from the platform. Past results stay.', 'Remove')
@@ -469,11 +475,24 @@ async function linkForm(server) {
   }
   let devices;
   try { devices = (await api('GET', `/integrations/${integrationId}/devices`)).data; } catch (e) { return toast(errMessage(e), true); }
-  const free = devices.filter((d) => !d.linked_server_id);
-  if (!free.length) return toast('Every device on that connection is already linked, or none were found.', true);
+  // A Microsoft 365 tenant is linked to its backed-up workloads (any number of them); every other server to one device.
+  const tenant = server.os_type === 'microsoft_365';
+  const free = devices.filter((d) => !d.linked_server_id && Boolean(d.workload) === tenant);
+  if (!free.length) return toast(tenant ? 'No Microsoft 365 backups to link on that connection yet. They appear once the connection has read them, or they are all linked already.' : 'Every device on that connection is already linked, or none were found.', true);
+  if (tenant) {
+    const doneTenant = await formModal({
+      title: `Link ${server.hostname} to its Microsoft 365 backups`, submitLabel: 'Link',
+      fields: [{ name: 'external_ids', label: 'Backups to read', type: 'checks', stacked: true, selectAll: true, options: free.map((d) => ({ value: d.id, label: `${d.name}${d.status ? ` (${label(d.status)})` : ''}` })), value: free.map((d) => d.id),
+        hint: 'BMS reads how these backups are doing and shows one status for the tenant. Choose every workload that is backed up for it.' }],
+      onSubmit: async (v) => { if (!v.external_ids.length) throw new Error('Choose at least one.'); for (const id of v.external_ids) await api('POST', `/servers/${server.id}/links`, { integration_id: Number(integrationId), external_id: id }); },
+    });
+    if (doneTenant) { toast('Linked. Status read from the platform.'); show(); }
+
+    return;
+  }
   const done = await formModal({
     title: `Link ${server.hostname} to a device`, submitLabel: 'Link',
-    fields: [{ name: 'external_id', label: 'Device on the platform', type: 'select', options: free.map((d) => ({ value: d.id, label: `${d.name}${d.status ? ` (${d.status})` : ''}` })), hint: 'BMS will read this device’s backup status from the platform.' }],
+    fields: [{ name: 'external_id', label: 'Device on the platform', type: 'select', options: free.map((d) => ({ value: d.id, label: `${d.name}${d.kind === 'vm' ? ' [VM]' : ''}${d.status ? ` (${d.status})` : ''}` })), hint: 'BMS will read this device’s backup status from the platform.' }],
     onSubmit: (v) => api('POST', `/servers/${server.id}/links`, { integration_id: Number(integrationId), external_id: v.external_id }),
   });
   if (done) { toast('Linked. Status read from the platform.'); show(); }
@@ -609,7 +628,7 @@ async function editActions(a) {
       fileLocs.length ? h('p', { class: 'small muted' }, 'Set in the agent\u2019s config file: ', fileLocs.join(', '), '.') : null,
       h('div', { class: 'row' }, h('button', { disabled: fresh.remote_actions === false, onclick: async () => { if (await locationPathForm(fresh, mapped, bmsLocations, null)) { toast('Saved'); overlay.remove(); show(); } } }, 'Set a location folder')),
       h('h3', {}, 'Sign-in for network shares'),
-      h('p', { class: 'small muted' }, 'The account the agent uses to open a location that is a network share (Windows). Without one, the agent uses the account it runs as, which is usually SYSTEM and has no network access. Passwords are encrypted in BMS and never shown again. Anyone who controls BMS can obtain them, so use a dedicated account with access to the backup share only.'),
+      h('p', { class: 'small muted' }, 'The account the agent uses to open a location that is a network share. On Windows it signs in with this; without one it uses the account it runs as, which is usually SYSTEM and has no network access. On Linux (agent 1.10 or later) it mounts the share with this, which needs the agent to run as root and the cifs-utils package; the location is then written as \\\\server\\share\\folder in the Locations list or on this page. Passwords are encrypted in BMS and never shown again. Anyone who controls BMS can obtain them, so use a dedicated account with access to the backup share only.'),
       table([
         { title: 'Location', render: ([k]) => h('code', {}, k) },
         { title: 'Signs in as', render: ([, u]) => u },
@@ -643,7 +662,10 @@ async function agents() {
   return h('div', {}, topbar('Agents', 'Small programs on your servers that run backups and restore tests when BMS asks. Each runs as a service that starts at boot and only ever calls BMS.'),
     h('p', { class: c.offline || c.outdated ? '' : 'muted', style: 'margin:0 0 12px' }, summary),
     card('Agents', table([
-      { title: 'Server', render: (a) => h('button', { class: 'link', onclick: () => serverDetail({ id: a.server_id }) }, a.hostname) },
+      { title: 'Server', render: (a) => h('div', {}, h('button', { class: 'link', onclick: () => serverDetail({ id: a.server_id }) }, a.hostname),
+        isAdmin() && h('div', { class: 'row small' },
+          h('button', { class: 'link', title: 'Remove this agent and get a new install command for the same server', onclick: () => replaceAgent(a) }, 'Re-enroll'),
+          h('button', { class: 'link', onclick: () => removeAgent(a) }, 'Remove'))) },
       { title: 'Status', render: (a) => h('span', {}, badge(a.online ? 'success' : 'failed', a.online ? 'Online' : 'Offline'),
         a.running_commands ? ' working' : (a.pending_commands ? ` ${a.pending_commands} waiting` : '')) },
       { title: 'Last seen', render: (a) => fmtAgo(a.last_seen_at) },
@@ -659,6 +681,8 @@ async function agents() {
     card('The agent program', d.release.available
       ? h('div', {},
         h('p', {}, `Version ${d.release.version ?? '?'} · `, h('a', { href: d.release.path, download: 'bms_agent.py' }, 'Download bms_agent.py'), ' · SHA-256 ', h('code', { style: 'word-break:break-all' }, d.release.sha256)),
+        d.release.bundles?.length > 0 && h('p', { class: 'small' }, 'No Python on a Linux server? ', d.release.bundles.map((b) => h('span', {}, h('a', { href: b.path, download: '' }, `Download the agent with its own Python (${b.arch}, ${(b.size / 1048576).toFixed(0)} MB)`), ' · SHA-256 ', h('code', { style: 'word-break:break-all' }, b.sha256), ' ')),
+          'Unpack it, then run ./bms-agent.sh --install … as root, in place of python3 bms_agent.py --install …'),
         h('p', { class: 'small muted' }, 'Easiest: enroll a server above and run the command it gives you. It installs the agent as a service (a systemd service on Linux, a scheduled task running as SYSTEM at boot on Windows). To update an agent, download the new file onto that server and run: python bms_agent.py --upgrade. To remove one: python bms_agent.py --uninstall, then remove it here.'))
       : h('p', { class: 'muted' }, 'The agent file is not on this BMS server.')));
 }
@@ -671,9 +695,20 @@ const codeBlock = (title, text) => h('div', { style: 'margin:10px 0' },
   h('div', { class: 'row', style: 'justify-content:space-between;align-items:center' }, h('strong', {}, title), h('button', { class: 'link', onclick: () => copyText(text) }, 'Copy')),
   h('pre', { style: 'white-space:pre-wrap;word-break:break-all;background:rgba(127,127,127,.15);padding:10px;border-radius:6px;font-size:12px;user-select:all' }, text));
 
-async function enrollAgent(server) {
+// Take an agent off a server. BMS stops giving it work and no longer accepts its secret; the software on the server keeps running until it is stopped there.
+async function removeAgent(a) {
+  if (!await confirmModal('Remove agent?', `${a.hostname} will stop receiving backup and test commands, and its secret stops working. Everything set for it in BMS (its locations, source folders, share sign-ins and actions) is deleted with it. The agent software on the server keeps running until you stop it there (python3 bms_agent.py --uninstall). To reinstall the agent and keep those settings, use Re-enroll instead.`, 'Remove')) return;
+  if (await act(() => api('DELETE', `/servers/${a.server_id}/agent`), 'Agent removed')) show();
+}
+// A new secret and install command for the same agent. Its locations, source folders, share sign-ins and actions set in BMS are kept.
+async function replaceAgent(a) {
+  if (!await confirmModal('Re-enroll this agent?', `${a.hostname} gets a new secret and a new install command. The current secret stops working at once and anything the agent was doing is cancelled. What you set for it in BMS (locations, source folders, share sign-ins and actions) is kept. Install the new command on the server; it replaces the agent software that is there.`, 'Re-enroll')) return;
+  await enrollAgent({ id: a.server_id, hostname: a.hostname }, true);
+  show();
+}
+async function enrollAgent(server, rotate = false) {
   let r;
-  try { r = await api('POST', `/servers/${server.id}/agent`); } catch (e) { return toast(errMessage(e), true); }
+  try { r = await api('POST', `/servers/${server.id}/agent${rotate ? '/rotate' : ''}`); } catch (e) { return toast(errMessage(e), true); }
   const config = JSON.stringify({
     bms_url: r.agent_config.bms_url, token: r.agent_config.token, poll_seconds: 30,
     actions: {
@@ -763,25 +798,40 @@ const failureCard = (rows) => card(`Backup problems to review (${rows.length})`,
     { title: '', render: (x) => me.role !== 'company_manager' && h('button', { class: 'link', onclick: () => reviewFailure(x) }, 'Review') },
   ], rows, { empty: 'Nothing to review.' }));
 
+const PLATFORM_STATE = { success: ['success', 'Backed up'], warning: ['warning', 'No recent backup'], failed: ['failed', 'Failed'], unknown: ['info', 'Nothing reported yet'] };
+// One list of every backup: the jobs BMS manages, and what the backup platform (Acronis) reports for each server linked to it. A platform row is what the
+// platform said when BMS last read it; BMS does not run or check those backups. The records BMS keeps of platform backups are not listed here.
 async function backups() {
-  const [jobs, srv, failures] = await Promise.all([api('GET', '/backup-jobs?limit=200'), api('GET', '/servers?limit=500'), api('GET', '/backup-failures?limit=100')]);
+  const [jobs, srv, failures, platform] = await Promise.all([api('GET', '/backup-jobs?limit=200&managed=1'), api('GET', '/servers?limit=500'), api('GET', '/backup-failures?limit=100'), api('GET', '/platform-backups')]);
   const addBtn = isAdmin() && h('button', { class: 'primary', onclick: () => jobForm(srv.data) }, 'New backup job');
-  return h('div', {}, topbar('Backups', null, addBtn), failureCard(failures.data), card(null, table([
-    { title: 'Server', render: (j) => j.hostname }, { title: 'Method', render: (j) => label(j.backup_method) },
-    { title: 'Backs up', render: (j) => scopeCell(j) },
-    { title: 'Location', render: (j) => j.location_name ? (j.destination_path ? `${j.location_name} / ${j.destination_path}` : j.location_name) : (LOCATION_METHODS.includes(j.backup_method) ? h('span', { class: 'muted' }, 'None set') : h('span', { class: 'muted', title: 'Platform backups use the locations configured on the platform.' }, 'On the platform')) },
-    { title: 'Schedule', render: (j) => (j.schedule ? h('code', {}, j.schedule) : '—') }, { title: 'Status', render: (j) => badge(j.status) },
-    { title: 'Size', render: (j) => (j.size_gb != null ? `${j.size_gb} GB` : '—') }, { title: 'Last run', render: (j) => fmtAgo(j.completed_time) },
-    { title: 'Tested', render: (j) => (j.test_status ? badge(j.test_status) : '—') },
-    { title: '', render: (j) => h('span', { class: 'row' },
-      isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await act(() => api('POST', `/backup-jobs/${j.id}/run`), 'Backup started. The agent picks it up within a minute.')) show(); } }, 'Run now'),
-      canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); runTest(j); } }, 'Run test'),
-      canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); manualTestForm(j); } }, 'Test by hand'),
-      isAdmin() && LOCATION_METHODS.includes(j.backup_method) && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobLocation(j); } }, 'Location'),
-      isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobScope(j); } }, 'Scope'),
-      isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); setStatus(j); } }, 'Update status'),
-      isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await confirmModal('Delete backup job?', `${j.hostname} / ${label(j.backup_method)}`, 'Delete') && await act(() => api('DELETE', `/backup-jobs/${j.id}`), 'Job deleted')) show(); } }, 'Delete')) },
-  ], jobs.data, { empty: 'No backup jobs yet.' })));
+  const rows = [...jobs.data.map((j) => ({ ...j, row: 'job' })), ...platform.data.map((p) => ({ ...p, row: 'platform' }))]
+    .sort((a, b) => a.hostname.localeCompare(b.hostname) || (a.row === b.row ? 0 : a.row === 'job' ? -1 : 1));
+  // A platform row acts on the newest record BMS holds for it, so the same test buttons work from either kind of row.
+  const asJob = (r) => (r.row === 'job' ? r : { id: r.job_id, server_id: r.server_id, hostname: r.hostname, backup_method: r.method });
+  const platformStatus = (r) => h('span', {}, badge(...PLATFORM_STATE[r.state] ?? ['info', label(r.state)]), r.platform_status && r.platform_status !== 'ok' ? h('div', { class: 'small muted' }, `Platform says: ${label(r.platform_status)}`) : '');
+  return h('div', {}, topbar('Backups', null, addBtn), failureCard(failures.data), card(`Backups (${rows.length})`,
+    h('p', { class: 'small muted' }, 'Backups BMS manages, and what the backup platform reports for each server linked to it, as BMS last read it. Link a server to its platform device from the server page.'),
+    table([
+      { title: 'Server', render: (r) => r.hostname },
+      { title: 'Backup', render: (r) => (r.row === 'job' ? label(r.backup_method) : h('span', {}, methodName(r.method), h('div', { class: 'small muted' }, r.connection))) },
+      { title: 'Backs up', render: (r) => (r.row === 'job' ? scopeCell(r) : h('span', {}, r.backup, r.kind === 'workload' && r.detail ? h('div', { class: 'small muted' }, r.detail) : '')) },
+      { title: 'Location', render: (r) => (r.row === 'platform' ? h('span', { class: 'muted', title: 'Platform backups use the locations configured on the platform.' }, 'On the platform')
+        : r.location_name ? (r.destination_path ? `${r.location_name} / ${r.destination_path}` : r.location_name) : (LOCATION_METHODS.includes(r.backup_method) ? h('span', { class: 'muted' }, 'None set') : h('span', { class: 'muted', title: 'Platform backups use the locations configured on the platform.' }, 'On the platform'))) },
+      { title: 'Schedule', render: (r) => (r.row === 'job' && r.schedule ? h('code', {}, r.schedule) : '—') },
+      { title: 'Status', render: (r) => (r.row === 'job' ? badge(r.status) : platformStatus(r)) },
+      { title: 'Size', render: (r) => (r.row === 'job' && r.size_gb != null ? `${r.size_gb} GB` : '—') },
+      { title: 'Last backup', render: (r) => (r.row === 'job' ? fmtAgo(r.completed_time) : h('span', {}, r.last_success_at ? fmtAgo(r.last_success_at) : 'None reported',
+        r.sync_error ? h('div', { class: 'bad small' }, r.sync_error) : r.synced_at ? h('div', { class: 'small muted' }, `read ${fmtAgo(r.synced_at)}`) : '')) },
+      { title: 'Tested', render: (r) => (r.test_status ? badge(r.test_status) : '—') },
+      { title: '', render: (r) => { const j = asJob(r); return h('span', { class: 'row' },
+        r.row === 'job' && isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await act(() => api('POST', `/backup-jobs/${j.id}/run`), 'Backup started. The agent picks it up within a minute.')) show(); } }, 'Run now'),
+        canRunTests() && j.id && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); runTest(j); } }, 'Run test'),
+        canRunTests() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); manualTestForm(j); } }, 'Test by hand'),
+        r.row === 'job' && isAdmin() && LOCATION_METHODS.includes(r.backup_method) && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobLocation(r); } }, 'Location'),
+        r.row === 'job' && isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); jobScope(r); } }, 'Scope'),
+        r.row === 'job' && isAdmin() && h('button', { class: 'link', onclick: (e) => { e.stopPropagation(); setStatus(r); } }, 'Update status'),
+        r.row === 'job' && isAdmin() && h('button', { class: 'link', onclick: async (e) => { e.stopPropagation(); if (await confirmModal('Delete backup job?', `${r.hostname} / ${label(r.backup_method)}`, 'Delete') && await act(() => api('DELETE', `/backup-jobs/${r.id}`), 'Job deleted')) show(); } }, 'Delete')); } },
+    ], rows, { empty: 'No backups yet. Add a backup job, or link a server to its backup platform.' })));
 }
 const scopeCell = (j) => {
   if (!j.scope_type) return h('span', { class: 'muted' }, 'Not stated');
@@ -959,11 +1009,11 @@ async function manualTestForm(job) {
   const done = await formModal({
     title: `Test by hand: ${job.hostname}`, submitLabel: 'Create test',
     fields: [
-      { name: 'test_type', label: 'Test', type: 'select', options: types.map((t) => ({ value: t.type, label: t.title })), value: job.backup_method === 'acronis_m365' || job.backup_method === 'microsoft_native_365' ? 'm365_mailbox' : 'random_restore',
+      { name: 'test_type', label: 'Test', type: 'select', hint: job.source, options: types.map((t) => ({ value: t.type, label: t.title })), value: job.backup_method === 'acronis_m365' || job.backup_method === 'microsoft_native_365' ? 'm365_mailbox' : 'random_restore',
         help: Object.fromEntries(types.map((t) => [t.type, t.summary.replace(/^Not built: would /, 'You ')])) },
       { name: 'target', label: 'What to sample (optional)', hint: 'A mailbox, site or folder. Leave it empty and BMS picks one from the tenant’s list, the one tested least recently.' },
     ],
-    onSubmit: async (v) => { created = (await api('POST', `/backup-jobs/${job.id}/manual-test`, { test_type: v.test_type, target: v.target.trim() || null })).data; },
+    onSubmit: async (v) => { created = (await api('POST', job.id ? `/backup-jobs/${job.id}/manual-test` : `/servers/${job.server_id}/manual-test`, { test_type: v.test_type, target: v.target.trim() || null })).data; },
   });
   if (done && created) { toast('Test created'); show(); openManualTest(created.id); }
 }
@@ -1137,7 +1187,7 @@ async function scheduleForm(existing) {
       { name: 'test_type', label: 'Test', type: 'select', options: types.map((t) => ({ value: t.type, label: t.automated ? t.title : `${t.title} (by hand only)` })), value: existing?.test_type ?? 'random_restore', help: Object.fromEntries(types.map((t) => [t.type, t.automated ? `${t.summary} Runs: ${t.runs}` : `${t.summary.replace(/^Not built: would /, 'A person ')}`])) },
       { name: 'target_kind', label: 'What to test', type: 'select', value: kind, options: [{ value: 'all', label: 'Every server' }, { value: 'servers', label: 'Selected servers (choose below)' }, { value: 'job', label: 'One backup job (choose below)' }],
         hint: 'Each server\u2019s newest successful backup of a kind the test can use. File tests (restore, write and read-back, full read-back, permissions) cover backups BMS can read: rsync, robocopy and manual copies. A recovery point check, and any test done by a person, covers every type, each one separately, including Acronis.' },
-      { name: 'servers', label: 'Servers (for Selected servers)', type: 'checks', stacked: true, selectAll: true, options: serverOptions, value: chosen },
+      { name: 'servers', label: 'Servers (for Selected servers)', type: 'checks', stacked: true, selectAll: true, hint: 'The Microsoft 365 tests (mailbox, OneDrive, SharePoint site) apply to Microsoft 365 tenants only, and a tenant needs no backup job: choose the tenant here, or Every server.', options: serverOptions, value: chosen },
       { name: 'job', label: 'Backup job (for One backup job)', type: 'select', options: jobOptions.length ? jobOptions : [{ value: '', label: 'No backup jobs yet' }], value: existing?.backup_job_id ? String(existing.backup_job_id) : (jobOptions[0]?.value ?? '') },
       { name: 'frequency', label: 'How often', type: 'select', options: [{ value: 'daily', label: 'Every day' }, { value: 'weekly', label: 'Every week' }, { value: 'monthly', label: 'Every month' }, { value: 'custom', label: 'Custom (cron)' }], value: existing?.frequency ?? 'weekly' },
       { name: 'run_time', label: 'Time of day (24 hour, HH:MM)', value: existing?.run_time ?? '02:00', hint: 'Not used for a custom schedule.' },
@@ -1273,28 +1323,81 @@ const PERIODS = {
   last_90: { label: 'Last 90 days', range: () => [Date.now() - 90 * DAY_MS, Date.now() + 60000] },
 };
 async function reports() {
-  const r = await api('GET', '/reports?limit=100');
-  return h('div', {}, topbar('Reports', 'Each report is saved as a snapshot. Open one and use your browser’s Print, then Save as PDF.', h('button', { class: 'primary', onclick: reportForm }, 'Generate report')),
+  const [r, sched] = await Promise.all([api('GET', '/reports?limit=100'), api('GET', '/report-schedules')]);
+  return h('div', {}, topbar('Reports', 'Each report is saved as a snapshot. Open it, or download it as a PDF. Use the anonymised PDF to send a report outside the company: the company, servers and staff are not named, and each server is shown by what it stores.', h('button', { class: 'primary', onclick: reportForm }, 'Generate report')),
     card(null, table([
       { title: 'Report', render: (x) => REPORT_LABEL[x.report_type] },
       { title: 'Period', render: (x) => (x.report_type === 'dr_readiness' ? 'As at generation' : `${fmtDate(x.period_start)} to ${fmtDate(new Date(new Date(x.period_end) - 1))}`) },
       { title: 'Generated', render: (x) => `${fmtDate(x.created_at)}${x.generated_by ? '' : ' (automatic)'}` },
-      { title: '', render: (x) => h('a', { href: `/api/reports/${x.id}/view`, target: '_blank', rel: 'noopener' }, 'Open') },
-    ], r.data, { empty: 'No reports yet. Generate one, or wait for the monthly and quarterly ones.' })));
+      { title: '', render: (x) => h('span', {}, h('button', { class: 'link', onclick: () => window.open(`/api/reports/${x.id}/view`, '_blank', 'noopener') }, 'Open'), ' · ', h('button', { class: 'link', onclick: () => downloadReport(x.id, false) }, 'PDF'), ' · ', h('button', { class: 'link', title: 'Names the company, servers and staff are replaced', onclick: () => downloadReport(x.id, true) }, 'Anonymised PDF')) },
+    ], r.data, { empty: 'No reports yet. Generate one, or wait for the monthly and quarterly ones.' })),
+    reportScheduleCard(sched.data, sched.periods));
 }
+const reportScheduleCard = (rows, periods) => card(`Scheduled reports (${rows.length})`,
+  h('div', { class: 'row', style: 'justify-content:space-between' },
+    h('p', { class: 'small muted' }, 'Reports that make themselves. Each one is saved with the others, and admins get a notification when it is ready. A schedule the engine was too late for makes one report when it is back. Periods run in UTC.'),
+    h('button', { class: 'primary', onclick: () => reportScheduleForm(null, periods) }, 'Schedule a report')),
+  table([
+    { title: 'Name', render: (s) => s.name }, { title: 'Report', render: (s) => REPORT_LABEL[s.report_type] },
+    { title: 'Covers', render: (s) => s.period_text }, { title: 'Repeats', render: (s) => s.describe },
+    { title: 'Next run', render: (s) => (s.enabled ? fmtDate(s.next_run_at) : badge('warning', 'Paused')) },
+    { title: 'Last run', render: (s) => (s.last_error ? h('span', {}, badge('failed', 'Failed'), h('div', { class: 'small' }, s.last_error)) : s.last_run_at ? h('span', {}, fmtAgo(s.last_run_at), s.last_report_id ? h('span', { class: 'small muted' }, ` \u00b7 report ${s.last_report_id}`) : '') : 'Never') },
+    { title: '', render: (s) => h('span', { class: 'row' },
+      h('button', { class: 'link', onclick: async () => { if (await act(() => api('PUT', `/report-schedules/${s.id}`, { enabled: !s.enabled }), s.enabled ? 'Paused' : 'Resumed')) show(); } }, s.enabled ? 'Pause' : 'Resume'),
+      h('button', { class: 'link', onclick: () => reportScheduleForm(s, periods) }, 'Edit'),
+      h('button', { class: 'link', onclick: async () => { if (await act(() => api('POST', `/report-schedules/${s.id}/run`), 'Report made')) show(); } }, 'Run now'),
+      h('button', { class: 'link', onclick: async () => { if (await confirmModal('Delete schedule?', `${s.name} will stop making reports. Reports already made are kept.`, 'Delete') && await act(() => api('DELETE', `/report-schedules/${s.id}`), 'Schedule deleted')) show(); } }, 'Delete')) },
+  ], rows, { empty: 'No scheduled reports yet.' }));
+async function reportScheduleForm(existing, periods) {
+  const done = await formModal({
+    title: existing ? `Edit "${existing.name}"` : 'Schedule a report', submitLabel: 'Save',
+    fields: [
+      { name: 'name', label: 'Name', required: true, value: existing?.name ?? '', hint: 'For example Monthly compliance.' },
+      { name: 'report_type', label: 'Report', type: 'select', options: Object.entries(REPORT_LABEL).map(([value, label]) => ({ value, label })), value: existing?.report_type ?? 'compliance' },
+      { name: 'period', label: 'Period it covers', type: 'select', options: Object.entries(periods).map(([value, label]) => ({ value, label })), value: existing?.period ?? 'previous_month', hint: 'Ignored for DR readiness, which is a snapshot of the moment it is made.' },
+      { name: 'frequency', label: 'How often', type: 'select', options: [{ value: 'weekly', label: 'Every week' }, { value: 'monthly', label: 'Every month' }, { value: 'quarterly', label: 'Every quarter' }, { value: 'custom', label: 'Custom (cron)' }], value: existing?.frequency ?? 'monthly' },
+      { name: 'run_time', label: 'Time of day (24 hour, HH:MM)', value: existing?.run_time ?? '06:00', hint: 'Not used for a custom schedule.' },
+      { name: 'weekday', label: 'Day of the week (weekly only)', type: 'select', options: WEEKDAYS.map((d, i) => ({ value: String(i), label: d })), value: String(existing?.frequency === 'weekly' ? existing.run_day : 1) },
+      { name: 'monthday', label: 'Day of the month (monthly and quarterly, 1 to 28)', value: String(['monthly', 'quarterly'].includes(existing?.frequency) ? existing.run_day : 1) },
+      { name: 'cron', label: 'Cron expression (custom only)', value: existing?.frequency === 'custom' ? existing.cron : '', hint: 'Five fields, for example 0 6 1 * * for 06:00 on the 1st. At most once a day.' },
+      { name: 'timezone', label: 'Time zone', value: existing?.timezone ?? browserZone(), hint: 'The time of day above is in this zone.' },
+    ],
+    onSubmit: async (v) => {
+      const body = { name: v.name.trim(), report_type: v.report_type, frequency: v.frequency, timezone: v.timezone.trim() };
+      if (v.report_type !== 'dr_readiness') body.period = v.period;
+      if (v.frequency === 'custom') body.cron = v.cron.trim();
+      else {
+        body.run_time = v.run_time.trim();
+        if (v.frequency === 'weekly') body.run_day = Number(v.weekday);
+        else body.run_day = Number(v.monthday);
+      }
+      await (existing ? api('PUT', `/report-schedules/${existing.id}`, body) : api('POST', '/report-schedules', body));
+    },
+  });
+  if (done) { toast('Schedule saved'); show(); }
+}
+const downloadReport = (id, anonymise) => { window.location.href = `/api/reports/${id}/pdf${anonymise ? '?anonymise=1' : ''}`; };
 async function reportForm() {
+  let made = null;
   const done = await formModal({
     title: 'Generate report', submitLabel: 'Generate',
     fields: [
       { name: 'report_type', label: 'Report', type: 'select', options: Object.entries(REPORT_LABEL).map(([value, label]) => ({ value, label })) },
       { name: 'period', label: 'Period', type: 'select', options: Object.entries(PERIODS).map(([value, p]) => ({ value, label: p.label })), hint: 'Ignored for DR readiness, which is a snapshot of right now.' },
+      { name: 'after', label: 'When it is ready', type: 'select', value: 'none', options: [{ value: 'none', label: 'Just save it' }, { value: 'pdf', label: 'Save it and download the PDF' }, { value: 'anon', label: 'Save it and download an anonymised PDF (for sending outside the company)' }],
+        hint: 'Either PDF can be downloaded again later from the list. The saved report keeps the names; only the anonymised PDF leaves them out.' },
     ],
     onSubmit: (v) => {
       const [from, to] = PERIODS[v.period].range();
-      return api('POST', '/reports', v.report_type === 'dr_readiness' ? { report_type: v.report_type } : { report_type: v.report_type, period_start: new Date(from).toISOString(), period_end: new Date(to).toISOString() });
+      return api('POST', '/reports', v.report_type === 'dr_readiness' ? { report_type: v.report_type } : { report_type: v.report_type, period_start: new Date(from).toISOString(), period_end: new Date(to).toISOString() })
+        .then((r) => { made = { id: r.data.id, after: v.after }; return r; });
     },
   });
-  if (done) { toast('Report generated'); show(); }
+  if (done) {
+    toast(made?.after === 'none' ? 'Report generated' : 'Report generated, downloading the PDF');
+    if (made && made.after !== 'none') downloadReport(made.id, made.after === 'anon');
+    show();
+  }
 }
 
 // --- integrations (admin) ---
@@ -1334,7 +1437,7 @@ async function importDevices(i) {
     title: `Import devices from ${i.name}`, submitLabel: 'Import selected',
     fields: [
       { name: 'ids', label: `Devices (${open.length} not yet linked)`, type: 'checks', value: open.filter((d) => d.protected).map((d) => d.id),
-        options: open.map((d) => ({ value: d.id, label: `${d.name} · ${d.status ? label(d.status) : 'no status'} · ${d.plans.length ? d.plans.join(', ') : 'no plan'}${d.matches_server_id ? ' · links to the existing server of this name' : ''}${d.suggested_hostname ? '' : ' · name unusable'}` })),
+        options: open.map((d) => ({ value: d.id, label: `${d.name}${d.kind === 'vm' ? ' (VM)' : ''} · ${d.status ? label(d.status) : 'no status'} · ${d.plans.length ? d.plans.join(', ') : 'no plan'}${d.matches_server_id ? ' · links to the existing server of this name' : ''}${d.suggested_hostname ? '' : ' · name unusable'}` })),
         hint: 'Devices with a protection plan are pre-selected. BMS reads plans, not licences, so check the list against your licensing.' },
       { name: 'os_type', label: 'Operating system for new servers', type: 'select', options: [{ value: 'windows', label: 'Windows' }, { value: 'linux', label: 'Linux' }], hint: 'Applies to servers created now. Change any of them later by editing the server.' },
       { name: 'link_existing', label: 'If a server with the same name exists', type: 'select', options: [{ value: 'true', label: 'Link it to the device' }, { value: 'false', label: 'Skip the device' }] },
@@ -1375,6 +1478,27 @@ async function integrationForm() {
     onSubmit: (v) => api('POST', '/integrations', { platform: 'acronis', name: v.name.trim(), base_url: v.base_url.trim(), client_id: v.client_id.trim(), client_secret: v.client_secret, stale_after_hours: Number(v.stale_after_hours) || 36 }),
   });
   if (done) { toast('Connected. Now link servers to their devices from each server.'); show(); }
+}
+
+// --- one dashboard for every company (platform admins only) ---
+async function overview() {
+  const { companies: rows, totals: t } = (await api('GET', '/platform/dashboard')).data;
+  const pct = (v) => (v === null ? '\u2014' : `${v}%`);
+  return h('div', {}, topbar('All companies', 'How every company is doing, those that need attention first. Only counts are shown here. Open a company to see its servers and failures; that visit is recorded in its audit log.'),
+    h('div', { class: 'grid' },
+      metric('Companies', t.companies, '', `${t.needing_attention} need attention`), metric('Need attention', t.needing_attention, t.needing_attention ? 'bad' : 'ok', t.needing_attention ? 'See below' : 'All clear'),
+      metric('Servers', t.servers, t.servers_failing ? 'bad' : '', `${t.servers_failing} failing`), metric('Backup problems open', t.open_backup_problems, t.open_backup_problems ? 'bad' : 'ok', ''),
+      metric('Test failures open', t.open_test_failures, t.open_test_failures ? 'bad' : 'ok', ''), metric('Tests waiting', t.tests_waiting, '', 'By hand, not yet done')),
+    card(null, table([
+      { title: 'Company', render: (c) => h('span', {}, h('strong', {}, c.name), c.attention ? h('div', { class: 'small' }, c.attention_reasons.join(' \u00b7 ')) : h('div', { class: 'small muted' }, c.servers.total ? 'Nothing needs attention' : 'No servers yet')) },
+      { title: 'Health', render: (c) => (c.health_score === null ? h('span', { class: 'muted' }, 'No data') : badge(c.health_score >= 90 ? 'success' : c.health_score >= 80 ? 'warning' : 'failed', String(c.health_score))) },
+      { title: 'Servers', render: (c) => `${c.servers.total}${c.servers.failing ? ` (${c.servers.failing} failing)` : ''}` },
+      { title: 'Backups, 30 days', render: (c) => `${pct(c.backups_30d.success_rate_pct)} of ${c.backups_30d.finished}${c.backups_30d.failed ? ` \u00b7 ${c.backups_30d.failed} failed` : ''}` },
+      { title: 'Tests, 30 days', render: (c) => `${pct(c.tests_30d.pass_rate_pct)} of ${c.tests_30d.total}` },
+      { title: 'Open problems', render: (c) => `${c.open_backup_failures} backup \u00b7 ${c.open_test_failures} test` },
+      { title: 'Last backup', render: (c) => (c.last_backup_at ? fmtAgo(c.last_backup_at) : 'Never') },
+      { title: '', render: (c) => (c.id === me.company.id ? h('span', { class: 'small muted' }, me.acting ? 'Open now' : 'Your company') : h('button', { class: 'link', onclick: () => enterCompany(c) }, 'Open')) },
+    ], rows, { empty: 'No active companies.' })));
 }
 
 // --- companies (platform admins only) ---
@@ -1533,6 +1657,7 @@ async function auditLog() {
 
 // --- profile + notifications ---
 async function profile() {
+  const rem = (await api('GET', '/reminders')).data.mine;
   return h('div', {}, topbar('My profile'),
     card(null, h('table', {}, h('tbody', {}, ...[['Username', me.user.username], ['Email', me.user.email], ['Company', me.company.company_name], ['Role', ROLE_LABEL[me.role]]].map(([k, v]) => h('tr', {}, h('th', {}, k), h('td', {}, v))))),
       h('div', { style: 'margin-top:14px' }, h('button', { onclick: changePw }, 'Change password'))),
@@ -1541,7 +1666,49 @@ async function profile() {
         h('div', { class: 'row' }, h('button', { onclick: changeAuthenticator }, 'Change authenticator app'), h('button', { onclick: newRecoveryCodes }, 'New recovery codes'),
           !me.mfa.required && h('button', { class: 'danger', onclick: turnOffMfa }, 'Turn off')),
         me.mfa.required && h('p', { class: 'small muted' }, 'Two-step sign-in is required here, so it cannot be turned off.'))
-      : h('div', {}, h('p', {}, badge('failed', 'Off'), ' Add a second step to your sign-in.'), h('button', { class: 'primary', onclick: mfaSetupScreen }, 'Set up'))));
+      : h('div', {}, h('p', {}, badge('failed', 'Off'), ' Add a second step to your sign-in.'), h('button', { class: 'primary', onclick: mfaSetupScreen }, 'Set up'))),
+    card('Mail reminders', h('div', {}, h('p', {}, rem.mail_reminders ? badge('success', 'On') : badge('warning', 'Off'), rem.mail_reminders ? ' You get a mail once a day while something needs your attention.' : ' You get no reminder mails.'),
+      h('div', { class: 'row' }, h('button', { onclick: async () => { if (await act(() => api('PUT', '/reminders/mine', { enabled: !rem.mail_reminders }), rem.mail_reminders ? 'Reminders turned off' : 'Reminders turned on')) show(); } }, rem.mail_reminders ? 'Turn off' : 'Turn on'),
+        rem.has_email && h('button', { onclick: sendReminderNow }, 'Send me one now')))));
+}
+const sendReminderNow = async () => {
+  try {
+    const r = (await api('POST', '/reminders/send-now')).data;
+    toast(r.delivers ? `Sent. It lists ${r.items} thing${r.items === 1 ? '' : 's'}.` : `Done, but mail is set to "${r.mailer}", which writes it to a log and delivers nothing.`, !r.delivers);
+  } catch (e) { toast(errMessage(e), true); }
+};
+// --- mail reminders (admin) ---
+const REMINDER_HOURS = Array.from({ length: 24 }, (_, i) => ({ value: String(i), label: `${String(i).padStart(2, '0')}:00` }));
+async function reminders() {
+  const d = (await api('GET', '/reminders')).data;
+  const s = d.settings;
+  const row = (k, v) => h('tr', {}, h('th', {}, k), h('td', {}, v));
+  return h('div', {}, topbar('Mail reminders', 'A mail once a day to the people who have something to fix or do: backup problems and test failures nobody has dealt with, tests waiting to be done, and servers not tested for 30 days. Nothing is sent when there is nothing to say.',
+    h('button', { class: 'primary', onclick: () => reminderForm(s) }, 'Change')),
+  !d.transport.delivers && h('div', { class: 'error', role: 'status' }, `Mail is set to "${d.transport.mailer}", so reminders are written to a log and not delivered. Set MAIL_MAILER and the mail server details in the .env file on the server (this needs a person with access to it), then use Send me one now to check.`),
+  card(null, h('table', {}, h('tbody', {}, row('Reminders', s.enabled ? badge('success', 'On') : badge('warning', 'Off')),
+    row('Sent at', `${String(s.send_hour).padStart(2, '0')}:00 (${s.timezone})${s.weekdays_only ? ', weekdays only' : ', every day'}`),
+    row('Goes to', `${d.recipients.length} ${d.recipients.length === 1 ? 'person' : 'people'}: admins${s.include_managers ? ', managers' : ''} and technicians (their own tests to do). Anyone can turn theirs off under My profile.`),
+    row('Mailing now', h('button', { onclick: sendReminderNow }, 'Send me one now'))))),
+  card('Recent', table([
+    { title: 'For day', render: (r) => r.for_date.slice(0, 10) }, { title: 'Person', render: (r) => r.username },
+    { title: 'Result', render: (r) => (r.status === 'sent' ? badge('success', 'Sent') : r.status === 'failed' ? badge('failed', 'Failed') : h('span', { class: 'muted' }, 'Nothing to say')) },
+    { title: 'Things listed', render: (r) => r.items }, { title: 'Problem', render: (r) => r.error ?? '' },
+  ], d.recent, { empty: 'Nothing sent yet.' })));
+}
+async function reminderForm(s) {
+  const done = await formModal({
+    title: 'Mail reminders', submitLabel: 'Save',
+    fields: [
+      { name: 'enabled', label: 'Send reminders', type: 'select', options: [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }], value: s.enabled ? 'yes' : 'no' },
+      { name: 'send_hour', label: 'Hour of the day', type: 'select', options: REMINDER_HOURS, value: String(s.send_hour) },
+      { name: 'timezone', label: 'Time zone', value: s.timezone, hint: 'For example Africa/Johannesburg or UTC. The hour above is in this zone.' },
+      { name: 'weekdays_only', label: 'Weekdays only', type: 'select', options: [{ value: 'yes', label: 'Yes, not on Saturday or Sunday' }, { value: 'no', label: 'No, every day' }], value: s.weekdays_only ? 'yes' : 'no' },
+      { name: 'include_managers', label: 'Also send to managers', type: 'select', options: [{ value: 'no', label: 'No, admins (and technicians for their own tests)' }, { value: 'yes', label: 'Yes' }], value: s.include_managers ? 'yes' : 'no' },
+    ],
+    onSubmit: (v) => api('PUT', '/reminders', { enabled: v.enabled === 'yes', send_hour: Number(v.send_hour), timezone: v.timezone.trim(), weekdays_only: v.weekdays_only === 'yes', include_managers: v.include_managers === 'yes' }),
+  });
+  if (done) { toast('Saved'); show(); }
 }
 async function changePw() {
   const done = await formModal({

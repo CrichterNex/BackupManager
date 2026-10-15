@@ -11,9 +11,18 @@ use DateTimeZone;
  */
 final class ManualSelection
 {
+    /** What each test samples: the noun, where it is, and what "that day" means for it. */
+    private const KINDS = [
+        'm365_mailbox' => ['noun' => 'email', 'where' => 'Inbox', 'verb' => 'received', 'place' => 'in the Inbox'],
+        'onedrive_file' => ['noun' => 'file', 'where' => 'OneDrive', 'verb' => 'last changed', 'place' => 'in this OneDrive, in any folder'],
+        'teams_channel' => ['noun' => 'message', 'where' => 'General channel', 'verb' => 'posted', 'place' => 'in this team\'s General channel'],
+        'sharepoint_site' => ['noun' => 'document', 'where' => 'Document libraries', 'verb' => 'last changed', 'place' => 'in this site\'s document libraries'],
+    ];
+
     /** @return array{folder: string, day: string, position: int, text: string, fallback: string} */
-    public static function generate(string $timezone): array
+    public static function generate(string $timezone, string $testType = 'm365_mailbox'): array
     {
+        $k = self::KINDS[$testType] ?? self::KINDS['m365_mailbox'];
         $tz = new DateTimeZone($timezone);
         $today = new DateTimeImmutable('today', $tz);
         $window = max(2, (int) config('bms.manual_pick_window_days'));
@@ -28,9 +37,9 @@ final class ManualSelection
         $position = random_int(1, max(1, (int) config('bms.manual_pick_max_position')));
 
         return [
-            'folder' => 'Inbox', 'day' => $day->format('Y-m-d'), 'position' => $position,
-            'text' => 'Open the '.self::ordinal($position).' email received on '.$day->format('l j F Y').' in the Inbox, counting from the earliest that day.',
-            'fallback' => 'If that day has fewer emails, take the last one that day. If it has none, use the nearest earlier weekday that has email. Either way, say what you used in the details.',
+            'folder' => $k['where'], 'day' => $day->format('Y-m-d'), 'position' => $position,
+            'text' => 'Open the '.self::ordinal($position)." {$k['noun']} {$k['verb']} on ".$day->format('l j F Y')." {$k['place']}, counting from the earliest that day.",
+            'fallback' => "If that day has fewer {$k['noun']}s, take the last one that day. If it has none, use the nearest earlier weekday that has one. Either way, say what you used in the details.",
         ];
     }
 

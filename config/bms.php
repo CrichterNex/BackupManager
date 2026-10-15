@@ -30,6 +30,8 @@ return [
     'workload_window_days' => (int) env('BMS_WORKLOAD_WINDOW_DAYS', 7),   // Microsoft 365 items count if their latest backup finished within this long
     'workload_failed_percent' => (float) env('BMS_WORKLOAD_FAILED_PERCENT', 5),   // a workload is failed when this share of its items failed in their latest backup
     'activity_lookback_days' => (int) env('BMS_ACTIVITY_LOOKBACK_DAYS', 7),   // the first read of an Acronis connection's activity starts this far back
+    'agent_bundle_dir' => env('BMS_AGENT_BUNDLE_DIR'),   // where agent bundles (agent + its own Python) are kept; storage/app/agent-bundles when empty
+    'agent_pickup_grace_minutes' => (int) env('BMS_AGENT_PICKUP_GRACE_MINUTES', 15),   // a queued backup the agent has not picked up, with the agent offline, is raised as a problem after this long
     'integration_sync_minutes' => (int) env('BMS_INTEGRATION_SYNC_MINUTES', 15),
 
     'agent_rate_limit_per_hour' => (int) env('BMS_AGENT_RATE_LIMIT_PER_HOUR', 1200),

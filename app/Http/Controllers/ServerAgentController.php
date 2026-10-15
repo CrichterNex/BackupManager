@@ -208,6 +208,25 @@ class ServerAgentController extends Controller
         return response()->json(['success' => true, 'data' => $agent->summary() + ['credential_users' => (object) $agent->credentialUsers()]]);
     }
 
+    /** A new secret and install command for the existing agent, keeping the settings made for it in BMS. */
+    public function rotate(Request $request, int $id)
+    {
+        $server = $this->server($request, $id);
+        [$agent, $secret] = DB::transaction(function () use ($server, $request) {
+            $result = AgentService::rotateSecret($server);
+            Audit::log($request, 'agent_secret_replaced', 'server', $server->id, ['hostname' => $server->hostname]);
+
+            return $result;
+        });
+
+        return response()->json([
+            'success' => true, 'data' => $agent->summary(),
+            'agent_config' => ['bms_url' => $request->getSchemeAndHttpHost(), 'token' => $secret],
+            'install' => AgentRelease::installCommands($request->getSchemeAndHttpHost(), $secret, BackupLocation::orderBy('name')->pluck('loc_key')->all()),
+            'agent_release' => AgentRelease::summary(),
+        ]);
+    }
+
     public function destroy(Request $request, int $id)
     {
         $server = $this->server($request, $id);

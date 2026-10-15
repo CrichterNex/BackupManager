@@ -41,10 +41,49 @@ final class AgentRelease
         return $agentVersion !== null && $current !== null && version_compare($agentVersion, $current, '<');
     }
 
+    public const ARCHES = ['x86_64', 'aarch64'];
+
+    /** Where agent bundles (the agent with its own Python, for machines that have none) are kept. They are made on request and put here by hand. */
+    public static function bundleDir(): string
+    {
+        return (string) (config('bms.agent_bundle_dir') ?: storage_path('app/agent-bundles'));
+    }
+
+    /** The newest bundle for a CPU type, or null if none has been put there. */
+    public static function bundle(string $arch): ?string
+    {
+        if (! in_array($arch, self::ARCHES, true)) {
+            return null;
+        }
+        $found = [];
+        foreach (glob(self::bundleDir()."/bms-agent-*-linux-$arch.tar.gz") ?: [] as $f) {
+            if (preg_match('/bms-agent-([0-9][0-9.]*)-linux-'.$arch.'\.tar\.gz$/', $f, $m)) {
+                $found[$m[1]] = $f;
+            }
+        }
+        uksort($found, fn ($a, $b) => version_compare($b, $a));
+
+        return $found ? reset($found) : null;
+    }
+
+    /** @return list<array{arch: string, version: string, sha256: string, size: int, path: string}> */
+    public static function bundles(): array
+    {
+        $out = [];
+        foreach (self::ARCHES as $arch) {
+            if ($f = self::bundle($arch)) {
+                preg_match('/bms-agent-([0-9][0-9.]*)-linux-/', basename($f), $m);
+                $out[] = ['arch' => $arch, 'version' => $m[1], 'sha256' => hash_file('sha256', $f), 'size' => filesize($f), 'path' => "/agent/bundle/$arch"];
+            }
+        }
+
+        return $out;
+    }
+
     /** What the Agents page shows next to the download link. */
     public static function summary(): array
     {
-        return ['version' => self::version(), 'sha256' => self::sha256(), 'path' => self::URL_PATH, 'available' => self::exists()];
+        return ['version' => self::version(), 'sha256' => self::sha256(), 'path' => self::URL_PATH, 'available' => self::exists(), 'bundles' => self::bundles()];
     }
 
     /**

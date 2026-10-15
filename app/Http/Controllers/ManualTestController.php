@@ -9,6 +9,7 @@ use App\Models\TestEvidence;
 use App\Services\Audit;
 use App\Services\CompanyTests;
 use App\Services\Engine\Engine;
+use App\Services\PlatformWorkloads;
 use App\Services\TestResults;
 use App\Support\ApiException;
 use App\Support\Constants;
@@ -160,11 +161,15 @@ class ManualTestController extends Controller
     // ---------------------------------------------------------------- creating and starting
 
     /** One sample item from the server's list: the one tested least recently, and never the same one twice in a row while others are waiting. */
-    public static function pickTarget(Server $server): ?string
+    public static function pickTarget(Server $server, ?string $testType = null): ?string
     {
         $targets = $server->test_targets ?? [];
         if (! $targets) {
-            return null;
+            // No list of the tenant's own: any mailbox, OneDrive or site Acronis has backed up, one not tested lately where there is a choice.
+            $recent = $testType ? BackupTestExecution::query()->join('backup_jobs as j', 'j.id', '=', 'backup_test_executions.backup_job_id')->where('j.server_id', $server->id)
+                ->where('backup_test_executions.test_type', $testType)->whereNotNull('backup_test_executions.target')->orderByDesc('backup_test_executions.id')->limit(200)->pluck('backup_test_executions.target')->all() : [];
+
+            return $testType ? PlatformWorkloads::pick($server, $testType, $recent)['name'] ?? null : null;
         }
         $last = BackupTestExecution::query()->join('backup_jobs as j', 'j.id', '=', 'backup_test_executions.backup_job_id')
             ->where('j.server_id', $server->id)->where('backup_test_executions.manual', true)->whereIn('backup_test_executions.target', $targets)
@@ -197,6 +202,31 @@ class ManualTestController extends Controller
         return $pool[array_rand($pool)];
     }
 
+    /**
+     * Start a test by hand for a server, with no backup job needed. It uses the server's newest backup job, and where there is none (a Microsoft 365
+     * tenant BMS has not read a backup for, say) a stand-in job that never ran, so the test has somewhere to live without inventing a backup. A job
+     * that never ran is not counted in reports or backup statistics.
+     */
+    public function storeForServer(Request $request, int $serverId)
+    {
+        $request->validate(['test_type' => ['required', Rule::in(Constants::TEST_TYPES)]]);
+        CompanyTests::assertActive($request->input('test_type')); // before any stand-in job is made, so a refused request leaves nothing behind
+        $q = Server::query()->where('active', true)->whereKey($serverId);
+        Scope::technician($q, $request->user(), 'servers.id');
+        $server = $q->first() ?? throw ApiException::notFound('Server', 'SERVER_001');
+
+        return $this->store($request, self::jobFor($server, $request->user()->id)->id);
+    }
+
+    /** The server's newest backup job, preferring a Microsoft 365 one, or a stand-in that never ran when it has none. */
+    public static function jobFor(Server $server, ?int $userId): BackupJob
+    {
+        return BackupJob::where('server_id', $server->id)->orderByRaw("backup_method IN ('acronis_m365', 'microsoft_native_365') DESC")->orderByDesc('id')->first()
+            ?? BackupJob::create(['is_record' => true, 'server_id' => $server->id, 'status' => 'scheduled', 'created_by' => $userId,
+                'backup_method' => $server->os_type === 'microsoft_365' ? (array_values(array_intersect($server->backup_methods ?? [], ['acronis_m365', 'microsoft_native_365']))[0] ?? 'acronis_m365') : ($server->backup_methods[0] ?? 'manual_copy'),
+                'status_message' => 'Stand-in for tests done by hand. No backup has been reported for this server.']);
+    }
+
     public function store(Request $request, int $jobId)
     {
         $b = $request->validate(['test_type' => ['required', Rule::in(Constants::TEST_TYPES)], 'target' => ['sometimes', 'nullable', 'string', 'max:500']]);
@@ -209,10 +239,11 @@ class ManualTestController extends Controller
                 throw ApiException::conflict('TEST_003', 'A manual test of this type is already waiting or in progress for this job.');
             }
             $server = Server::findOrFail($job->server_id);
-            $target = isset($b['target']) && trim($b['target']) !== '' ? trim($b['target']) : self::pickTarget($server);
+            $target = isset($b['target']) && trim($b['target']) !== '' ? trim($b['target']) : self::pickTarget($server, $b['test_type']);
             // Only the Microsoft 365 mailbox test uses a reference item, and the item is copied into the test so later edits to the list cannot change it.
             $reference = $b['test_type'] === 'm365_mailbox' ? self::pickReference($server) : null;
-            $selection = $b['test_type'] === 'm365_mailbox' ? ManualSelection::generate($server->timezone ?: 'UTC') : null;
+            // A mailbox, a OneDrive and a site are all sampled the same way: a day and a position, chosen now so the tester cannot pick an easy one.
+            $selection = in_array($b['test_type'], Constants::M365_TEST_TYPES, true) ? ManualSelection::generate($server->timezone ?: 'UTC', $b['test_type']) : null;
             $test = BackupTestExecution::create(['backup_job_id' => $jobId, 'test_type' => $b['test_type'], 'manual' => true, 'target' => $target, 'reference' => $reference, 'selection' => $selection, 'scheduled_time' => now()]);
             Audit::log($request, 'manual_test_created', 'test', $test->id, ['backup_job_id' => $jobId, 'test_type' => $b['test_type'], 'target' => $target]);
 
@@ -449,7 +480,7 @@ class ManualTestController extends Controller
                 // The record of the item must hold together: the right item, not later than its recovery point, a recent point, an attachment that opens.
                 if (ManualChecklists::fields($t->test_type)) {
                     $job = BackupJob::find($t->backup_job_id);
-                    ManualFindings::assertPassable($t->findings ?? [], $t->selection, Server::find($job?->server_id)?->timezone ?: 'UTC', Engine::allowedAgeHours($job?->schedule));
+                    ManualFindings::assertPassable($t->findings ?? [], $t->selection, Server::find($job?->server_id)?->timezone ?: 'UTC', Engine::allowedAgeHours($job?->schedule), null, $t->test_type);
                 }
             } elseif (trim((string) ($b['notes'] ?? '')) === '') {
                 throw ApiException::badRequest('Say what went wrong in the notes, so the person who reviews the failure knows.');

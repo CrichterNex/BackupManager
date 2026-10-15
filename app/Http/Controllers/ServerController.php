@@ -23,7 +23,7 @@ use Illuminate\Validation\Rule;
 
 class ServerController extends Controller
 {
-    private const COLS = ['hostname', 'ip_address', 'os_type', 'os_name', 'criticality', 'backup_methods', 'retention_policy_days', 'notes', 'test_targets', 'reference_items', 'timezone'];
+    private const COLS = ['hostname', 'ip_address', 'os_type', 'os_name', 'criticality', 'backup_methods', 'retention_policy_days', 'data_function', 'notes', 'test_targets', 'reference_items', 'timezone'];
 
     /** What can protect a Microsoft 365 tenant: it has no files on a machine, so the file-copy methods make no sense for it. */
     private const M365_METHODS = ['acronis_m365', 'microsoft_native_365'];
@@ -85,6 +85,8 @@ class ServerController extends Controller
             'backup_methods' => ['sometimes', 'array', 'max:'.count(Constants::BACKUP_METHODS)],
             'backup_methods.*' => [Rule::in(Constants::BACKUP_METHODS)],
             'retention_policy_days' => ['sometimes', 'nullable', 'integer:strict', 'min:1'],
+            // What it stores or does. An anonymised report shows this in place of the server's name.
+            'data_function' => ['sometimes', 'nullable', 'string', 'max:255'],
             'notes' => ['sometimes', 'nullable', 'string', 'max:5000'],
             // Mailboxes, sites or other items a person samples when testing a Microsoft 365 tenant.
             'test_targets' => ['sometimes', 'nullable', 'array', 'max:500'],

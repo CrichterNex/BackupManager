@@ -94,6 +94,8 @@ final class TestScheduling
         $methods = $s->test_type === 'platform_validation' && ! $s->manual ? ['acronis'] : ($perMethod ? Constants::BACKUP_METHODS : Constants::FILESYSTEM_METHODS);
         $jobs = BackupJob::query()->join('servers as s', 's.id', '=', 'backup_jobs.server_id')
             ->where('s.active', true)->whereIn('backup_jobs.backup_method', $methods)->select('backup_jobs.id', 'backup_jobs.server_id', 'backup_jobs.backup_method');
+        // The Microsoft 365 tests are for tenants, not for the other servers an "every server" schedule would reach.
+        in_array($s->test_type, Constants::M365_TEST_TYPES, true) && $jobs->where('s.os_type', 'microsoft_365');
         if ($s->target_type === 'job') {
             return $jobs->where('backup_jobs.id', $s->backup_job_id);
         }
@@ -122,21 +124,40 @@ final class TestScheduling
     public static function queue(TestSchedule $s, ?int $userId): int
     {
         $queued = 0;
-        foreach (self::eligible($s)->get() as $job) {
-            $busy = BackupTestExecution::where('backup_job_id', $job->id)->where('test_type', $s->test_type)->where('manual', (bool) $s->manual)->whereIn('test_status', ['pending', 'running'])->exists();
+        $covered = [];
+        $queueOn = function (int $jobId, int $serverId) use ($s, $userId, &$queued) {
+            $busy = BackupTestExecution::where('backup_job_id', $jobId)->where('test_type', $s->test_type)->where('manual', (bool) $s->manual)->whereIn('test_status', ['pending', 'running'])->exists();
             if ($busy) {
-                continue;
+                return;
             }
             if ($s->manual) {
                 // Nobody has started it yet, so nobody is recorded as having done it. The sample item (a mailbox, say) is picked now so the tester sees it.
-                $server = Server::find($job->server_id);
-                BackupTestExecution::create(['backup_job_id' => $job->id, 'test_type' => $s->test_type, 'manual' => true, 'target' => $server ? ManualTestController::pickTarget($server) : null,
-                    'reference' => $server && $s->test_type === 'm365_mailbox' ? ManualTestController::pickReference($server) : null,
-                    'selection' => $server && $s->test_type === 'm365_mailbox' ? ManualSelection::generate($server->timezone ?: 'UTC') : null, 'notes' => 'Scheduled: '.$s->name]);
+                $server = Server::find($serverId);
+                $mailbox = $server && $s->test_type === 'm365_mailbox';
+                $m365 = $server && in_array($s->test_type, Constants::M365_TEST_TYPES, true);
+                BackupTestExecution::create(['backup_job_id' => $jobId, 'test_type' => $s->test_type, 'manual' => true, 'target' => $server ? ManualTestController::pickTarget($server, $s->test_type) : null,
+                    'reference' => $mailbox ? ManualTestController::pickReference($server) : null,
+                    'selection' => $m365 ? ManualSelection::generate($server->timezone ?: 'UTC', $s->test_type) : null, 'notes' => 'Scheduled: '.$s->name]);
             } else {
-                BackupTestExecution::create(['backup_job_id' => $job->id, 'test_type' => $s->test_type, 'executed_by' => $userId, 'notes' => 'Scheduled: '.$s->name]);
+                BackupTestExecution::create(['backup_job_id' => $jobId, 'test_type' => $s->test_type, 'executed_by' => $userId, 'notes' => 'Scheduled: '.$s->name]);
             }
             $queued++;
+        };
+        foreach (self::eligible($s)->get() as $job) {
+            $covered[$job->server_id] = true;
+            $queueOn($job->id, $job->server_id);
+        }
+        // A Microsoft 365 tenant is tested by a person and needs no successful backup job of its own: it is covered whether or not Acronis has been
+        // read for it. Where it has no job at all, a stand-in that never ran gives the test somewhere to live.
+        if ($s->manual && in_array($s->test_type, Constants::M365_TEST_TYPES, true) && $s->target_type !== 'job') {
+            $tenants = Server::where('active', true)->where('os_type', 'microsoft_365');
+            $s->target_type === 'server' && $tenants->where('id', $s->server_id);
+            $s->target_type === 'servers' && $tenants->whereIn('id', $s->server_ids ?? []);
+            foreach ($tenants->get() as $server) {
+                if (! isset($covered[$server->id])) {
+                    $queueOn(ManualTestController::jobFor($server, $userId)->id, $server->id);
+                }
+            }
         }
 
         return $queued;

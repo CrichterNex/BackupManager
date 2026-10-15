@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Report;
 use App\Services\Audit;
+use App\Services\Reports\ReportPdf;
 use App\Services\Reports\ReportRenderer;
 use App\Services\Reports\ReportService;
 use App\Support\ApiException;
@@ -75,11 +76,24 @@ class ReportController extends Controller
         return response()->json(['success' => true, 'data' => Report::find($id) ?? throw ApiException::notFound('Report', 'REPORT_001')]);
     }
 
-    // Print-ready page. Use the browser's Print, then Save as PDF, to produce a PDF.
-    public function view(int $id)
+    // Print-ready page. ?anonymise=1 takes the names out, so it can be sent outside the company.
+    public function view(Request $request, int $id)
     {
         $report = Report::find($id) ?? throw ApiException::notFound('Report', 'REPORT_001');
+        $anon = $request->boolean('anonymise');
+        $anon && Audit::log($request, 'report_exported', 'report', $report->id, ['format' => 'html', 'anonymised' => true]);
 
-        return response(ReportRenderer::render($report->data, $report->id))->header('Content-Type', 'text/html; charset=UTF-8');
+        return response(ReportRenderer::render($report->data, $report->id, $anon))->header('Content-Type', 'text/html; charset=UTF-8');
+    }
+
+    // The same report as a PDF file. The file name has no company or server name in it, so it is safe to send as it is.
+    public function pdf(Request $request, int $id)
+    {
+        $report = Report::find($id) ?? throw ApiException::notFound('Report', 'REPORT_001');
+        $anon = $request->boolean('anonymise');
+        Audit::log($request, 'report_exported', 'report', $report->id, ['format' => 'pdf', 'anonymised' => $anon]);
+        $pdf = ReportPdf::make(ReportRenderer::render($report->data, $report->id, $anon, true), $report->report_type !== 'security');
+
+        return response($pdf, 200, ['Content-Type' => 'application/pdf', 'Content-Disposition' => 'attachment; filename="bms-'.$report->report_type.'-'.$report->id.($anon ? '-anonymised' : '').'.pdf"', 'X-Content-Type-Options' => 'nosniff']);
     }
 }

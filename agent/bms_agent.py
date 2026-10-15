@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.9.0"
+VERSION = "1.10.3"
 OUTPUT_TAIL = 4000          # characters of command output sent back to BMS
 HTTP_TIMEOUT = 30           # seconds for each call to BMS
 DEFAULT_BACKUP_SECONDS = 8 * 3600
@@ -79,10 +79,13 @@ def validate_config(cfg):
                 raise ConfigError("action '%s': 'command' must be a list of strings, e.g. [\"/usr/local/bin/backup.sh\"]. "
                                   "It is run directly, not through a shell." % name)
         else:
-            # With "locations" below, BMS names the location per job and no path is needed here. Without them, the action carries one path.
-            if not cfg.get("locations") and (not isinstance(a.get("path"), str) or not a["path"]):
+            # With "locations" below, BMS names the location per job and no path is needed here. Without them, the action carries one path. When BMS
+            # manages the locations (remote actions on) they may all be set there, so a file with none is fine: it would otherwise refuse to start
+            # just because the last location was moved from the file to BMS.
+            if not cfg.get("locations") and not cfg["remote_actions"] and (not isinstance(a.get("path"), str) or not a["path"]):
                 raise ConfigError("action '%s': a restore_test needs a 'path' (the folder holding the backup), or add a 'locations' map" % name)
 
+    cfg["actions"] = actions  # a config with no "actions" key (BMS supplies them) still has the empty set the rest of the agent reads
     locs = cfg.get("locations", {})
     if not isinstance(locs, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in locs.items()):
         raise ConfigError("'locations' must map a location key to a folder path, e.g. {\"nas-main\": \"/mnt/nas/backups\"}")
@@ -173,6 +176,10 @@ def effective_actions(cfg):
     for kind in ("robocopy", "rsync"):
         if kind not in actions and builtin_available(kind):
             actions[kind] = {"type": kind}
+    # Restore tests read the backup locations and change nothing, so the agent offers them itself whenever it has locations to read (from its file, or from
+    # BMS when remote actions are on). An agent installed without --location would otherwise have no restore test and BMS could not run one.
+    if not any(a.get("type") == "restore_test" for a in actions.values()) and declared_locations(cfg):
+        actions["restore-test"] = {"type": "restore_test"}
     if cfg.get("remote_actions"):
         for name, m in cfg.get("_managed", {}).items():
             if (actions.get(name) or {}).get("type") == "restore_test":
@@ -222,7 +229,8 @@ def effective_source_roots(cfg):
 # An admin can give BMS a user name and password for a location's network share (Agents page, Edit). BMS sends them over
 # HTTPS only when they change; they live in this process's memory and are never written to disk or the log. On Windows the
 # agent signs in to the share through the operating system directly (no "net use", so the password is never on a command line).
-# Linux locations are mounted folders, so the mount (fstab or a credentials file) is where their login belongs.
+# On Linux the agent mounts a location written as a share with the same login (see "mounting a network share on Linux" below); a location that
+# is already a mounted folder needs no login here.
 
 def clean_managed_credentials(raw):
     out = {}
@@ -270,25 +278,172 @@ def _wnet_connect(share, user, password):
     return rc
 
 
-def ensure_location_access(cfg, location):
-    """Sign in to the location's share with the credentials BMS holds for it. None when nothing is needed or it worked, else a message."""
-    cred = cfg.get("_credentials", {}).get(location) if cfg.get("remote_actions") else None
-    share = share_root(effective_locations(cfg).get(location)) if cred else None
-    if not cred or not share or os.name != "nt":
-        return None
-    rc = _wnet_connect(share, cred["username"], cred["password"])
-    if rc in (0, 85):  # 85: this connection already exists
-        return None
-    return "Could not sign in to %s as %s: %s (code %d)." % (share, cred["username"], _windows_message(rc), rc)
-
-
-def effective_locations(cfg):
-    """The config file's locations, plus (when remote actions are on) the ones set in BMS. The file wins for a key it defines."""
+def declared_locations(cfg):
+    """The config file's locations, plus (when remote actions are on) the ones set in BMS, exactly as written. The file wins for a key it defines."""
     locs = dict(cfg["locations"])
     if cfg.get("remote_actions"):
         for key, path in cfg.get("_managed_locations", {}).items():
             locs.setdefault(key, path)
     return locs
+
+
+def effective_locations(cfg):
+    """Where each location is on this machine. A network share path that this Linux agent has mounted is the mounted folder."""
+    locs = declared_locations(cfg)
+    for key, local in cfg.get("_mounted", {}).items():
+        if key in locs:
+            locs[key] = local
+    return locs
+
+
+def config_override_note(cfg, key):
+    """When the config file and BMS both set a location and differ, the file wins and that is a common reason for a path that looks wrong."""
+    managed = cfg.get("_managed_locations", {}).get(key) if cfg.get("remote_actions") else None
+    if managed and key in cfg["locations"] and cfg["locations"][key] != managed:
+        return (" Note: this location is also set in the agent's config file ('%s'), and the config file overrides the one set in BMS ('%s'). "
+                "Remove it from the config file to use the BMS setting." % (cfg["locations"][key], managed))
+    return ""
+
+
+# --- mounting a network share on Linux ------------------------------------------------------------
+# A location written as a share (\\server\share\folder or //server/share/folder) cannot be opened directly on Linux. With the share's login held in BMS the
+# agent mounts it (CIFS) under a private folder, then uses the mounted folder. The password goes to mount.cifs through its environment, never on a command
+# line or into a file. The mount is left in place and reused until the machine restarts. This needs root and the mount.cifs program (package cifs-utils).
+
+MOUNT_ROOT = "/var/lib/bms-agent/mounts"
+CIFS_VERSIONS = ("3.0", "2.1", "2.0", "1.0")
+
+
+def unc_parts(path):
+    """(server, share, [folders...]) from \\\\server\\share\\a\\b or //server/share/a/b, or None when the path is not a share."""
+    m = re.match(r"^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)(?:[\\/]+(.*))?$", path or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2), [p for p in re.split(r"[\\/]+", m.group(3) or "") if p]
+
+
+def is_mounted(mountpoint, mounts_file="/proc/mounts"):
+    try:
+        with open(mounts_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f.read().splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1].replace("\\040", " ") == mountpoint and parts[2] in SMB_FILESYSTEMS:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def tcp_reachable(host, port=445, timeout=5):
+    """None when a connection to host:port opens, else why not."""
+    import socket
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return None
+    except OSError as e:
+        return str(e)
+
+
+# mount.cifs errors that say the server did not like that SMB version (try the next), against ones that no other version will cure (stop and say so).
+_VERSION_ERRORS = {95, 22, 112, 115}
+_STOP_ERRORS = {
+    13: "the server refused the user name or password, or this account may not use that share",
+    2: "the share name was not found on the server",
+    111: "the server refused the connection",
+    110: "the connection to the server timed out",
+    113: "there is no route to the server",
+}
+
+
+def mount_share(host, share, user, password, mount_root=None, run=None, which=None, is_root=None, tcp_open=None):
+    """Mount //host/share and return (mount point, None), or (None, a message that says what to do)."""
+    mount_root = mount_root or MOUNT_ROOT
+    run = run or subprocess.run
+    which = which or shutil.which
+    if not (re.fullmatch(r"[A-Za-z0-9._-]{1,100}", host) and re.fullmatch(r"[A-Za-z0-9._ $-]{1,100}", share)):
+        return None, "The share name '\\\\%s\\%s' has characters this agent will not pass to a mount command." % (host, share)
+    if "," in user or "%" in user or "\n" in user or "\0" in password:
+        return None, "The share user name cannot contain a comma or a percent sign."
+    if not (is_root if is_root is not None else (hasattr(os, "geteuid") and os.geteuid() == 0)):
+        return None, "Mounting the share '\\\\%s\\%s' needs the agent to run as root." % (host, share)
+    helper = which("mount.cifs") or next((p for p in ("/sbin/mount.cifs", "/usr/sbin/mount.cifs", "/usr/bin/mount.cifs") if os.path.exists(p)), None)
+    if not helper:
+        return None, ("mount.cifs is not installed on this machine, so the agent cannot mount '\\\\%s\\%s'. Install it (the cifs-utils package), or mount the "
+                      "share yourself and set the location to the mounted folder." % (host, share))
+    mp = os.path.join(mount_root, "%s_%s" % (host.lower(), re.sub(r"[^a-z0-9._-]", "-", share.lower())))
+    os.makedirs(mp, mode=0o700, exist_ok=True)
+    os.chmod(mount_root, 0o700)
+    if is_mounted(mp):
+        return mp, None
+    # Tell a network problem from an SMB one before trying versions: nothing speaks SMB if port 445 does not answer.
+    blocked = (tcp_open or tcp_reachable)(host)
+    if blocked:
+        return None, ("Cannot reach '%s' on port 445 (SMB): %s. Check that the name resolves and that the server's firewall allows SMB from this machine." % (host, blocked))
+    # DOMAIN\user is given to mount.cifs as a domain and a user, which it takes more reliably than the joined form.
+    domain, name = (user.split("\\", 1) if "\\" in user else (None, user))
+    env = dict(os.environ, PASSWD=password)
+    tried = []
+    for vers in CIFS_VERSIONS:
+        opts = "username=%s,%svers=%s,rw,uid=0,gid=0,file_mode=0600,dir_mode=0700,iocharset=utf8" % (name, "domain=%s," % domain if domain else "", vers)
+        cmd = [helper, "//%s/%s" % (host, share), mp, "-o", opts]
+        try:
+            p = run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return None, "Could not run mount.cifs for '\\\\%s\\%s': %s" % (host, share, e)
+        if p.returncode == 0:
+            return mp, None
+        out = (p.stdout or b"").decode("utf-8", "replace").replace(password, "********").strip()
+        first = out.splitlines()[0] if out else "no message"
+        tried.append("SMB %s: %s" % (vers, first))
+        m = re.search(r"mount error\((\d+)\)", out)
+        code = int(m.group(1)) if m else None
+        if code in _STOP_ERRORS:
+            break
+        if code is not None and code not in _VERSION_ERRORS and vers != CIFS_VERSIONS[-1]:
+            continue
+    try:
+        os.rmdir(mp)
+    except OSError:
+        pass
+    why = ""
+    code = None
+    m = re.search(r"mount error\((\d+)\)", tried[-1]) if tried else None
+    if m:
+        code = int(m.group(1))
+    if code in _STOP_ERRORS:
+        why = " That means " + _STOP_ERRORS[code] + "."
+    elif code in _VERSION_ERRORS or len(tried) == len(CIFS_VERSIONS):
+        why = (" The server answered but refused every SMB version this machine can speak (an older Linux kernel supports up to SMB 3.0). Check on the server whether it "
+               "requires SMB 3.1.1 only, encryption or signing, and run 'dmesg | tail' on this machine: the CIFS VFS line says why.")
+    return None, "Could not mount '\\\\%s\\%s' as %s. %s.%s" % (host, share, user, "; ".join(tried), why)
+
+
+def ensure_location_access(cfg, location):
+    """Make the location's share usable with the login BMS holds for it. None when nothing is needed or it worked, else a message.
+    Windows signs in to the share. Linux mounts it and uses the mounted folder."""
+    declared = declared_locations(cfg).get(location)
+    cred = cfg.get("_credentials", {}).get(location) if cfg.get("remote_actions") else None
+    if os.name == "nt":
+        share = share_root(declared) if cred else None
+        if not cred or not share:
+            return None
+        rc = _wnet_connect(share, cred["username"], cred["password"])
+        if rc in (0, 85):  # 85: this connection already exists
+            return None
+        return "Could not sign in to %s as %s: %s (code %d)." % (share, cred["username"], _windows_message(rc), rc)
+    parts = unc_parts(declared)
+    if not parts:
+        cfg.get("_mounted", {}).pop(location, None)
+        return None
+    host, share, folders = parts
+    if not cred:
+        return ("The location '%s' is a network share ('%s') and this agent has no sign-in for it. Enter the share's user name and password on the Agents page "
+                "(Edit), or mount the share yourself and set the location to the mounted folder.%s" % (location, declared, config_override_note(cfg, location)))
+    mp, why = mount_share(host, share, cred["username"], cred["password"])
+    if why:
+        return why
+    cfg.setdefault("_mounted", {})[location] = os.path.join(mp, *folders) if folders else mp
+    return None
 
 
 def action_timeout(a):
@@ -414,8 +569,13 @@ def folder_problem(path, what):
                     "that already has access." % run_as())
         return "Access denied to %s '%s'.%s" % (what, path, hint)
     except FileNotFoundError:
+        hint = ""
+        if os.name != "nt" and (path.startswith(("//", "\\\\")) or path.lower().startswith("smb:") or not os.path.isabs(path)):
+            hint = (" This looks like a network share path, or a path relative to the agent's working folder. A Linux machine cannot write to a share "
+                    "directly: mount it first (for example mount -t cifs //server/share /mnt/share -o credentials=/root/.smbcred) and set this "
+                    "location to the mounted folder, such as /mnt/share/backups. Passwords entered in BMS are used on Windows only.")
         return ("%s '%s' does not exist, or this agent (running as '%s') cannot see it. The agent never creates a location's own folder, "
-                "so a mistyped path cannot start a backup in the wrong place. Create it, or fix the path on the Agents page." % (what.capitalize(), path, run_as()))
+                "so a mistyped path cannot start a backup in the wrong place. Create it, or fix the path on the Agents page.%s" % (what.capitalize(), path, run_as(), hint))
     except OSError as e:
         return "%s '%s' cannot be opened: %s" % (what.capitalize(), path, e)
     if not stat.S_ISDIR(st.st_mode):
@@ -442,8 +602,34 @@ def backup_target(layout, src, dest):
     raise ValueError("unknown layout '%s'" % layout)
 
 
-def build_backup_command(kind, src, target, excluded):
-    """The argument list for one source folder. Exclusions are only those inside this folder."""
+SMB_FILESYSTEMS = ("cifs", "smb3", "smbfs")
+
+
+def filesystem_type(path, mounts_file="/proc/mounts"):
+    """The file system a path is on (cifs, ext4, nfs...), from the longest mount point that contains it. None where that cannot be told."""
+    try:
+        with open(mounts_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        here = os.path.realpath(path)
+    except OSError:
+        return None
+    best = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount = parts[1].replace("\\040", " ")  # /proc/mounts writes a space in a path as \040
+        if here == mount or mount == "/" or here.startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= len(best[0]):
+                best = (mount, parts[2])
+    return best[1] if best else None
+
+
+def build_backup_command(kind, src, target, excluded, target_fs=None):
+    """The argument list for one source folder. Exclusions are only those inside this folder.
+    target_fs is the file system the backup is written to. On an SMB share rsync cannot set owners, permissions or symbolic links, and with
+    -a it reports each one as an error and exits 23, so the backup is made without them (file times are kept; a 2 second window covers
+    the share's coarser clock)."""
     inner = [e for e in excluded if inside(e, src) and _norm(e) != _norm(src)]
     if kind == "robocopy":
         if re.match(r"^[A-Za-z]:[\\/]*$", src):
@@ -456,7 +642,7 @@ def build_backup_command(kind, src, target, excluded):
         if files:
             cmd += ["/XF"] + files
         return cmd
-    cmd = ["rsync", "-a", "--partial"]
+    cmd = ["rsync", "-rt", "--no-perms", "--no-owner", "--no-group", "--modify-window=2", "--partial"] if target_fs in SMB_FILESYSTEMS else ["rsync", "-a", "--partial"]
     for e in inner:
         rel = os.path.relpath(e, src).replace(os.sep, "/")
         cmd.append("--exclude=/" + re.sub(r"([\\*?\[])", r"\\\1", rel))
@@ -489,10 +675,11 @@ def run_builtin_backup(cfg, kind, cmd):
     # The location's own folder must already exist. Only the job's folders below it are created.
     problem = folder_problem(effective_locations(cfg)[cmd["location"]], "the backup location folder")
     if problem:
-        return "failed", None, problem, None
+        return "failed", None, problem + config_override_note(cfg, cmd["location"]), None
     try:
         os.makedirs(dest, exist_ok=True)
-        plan = [(f, build_backup_command(kind, f, backup_target(layout, f, dest), excluded)) for f in folders]
+        target_fs = filesystem_type(dest) if kind == "rsync" else None
+        plan = [(f, build_backup_command(kind, f, backup_target(layout, f, dest), excluded, target_fs)) for f in folders]
     except PermissionError as e:
         return "failed", None, "Access denied creating '%s' inside the backup location: %s" % (dest, e), None
     except (ValueError, OSError) as e:

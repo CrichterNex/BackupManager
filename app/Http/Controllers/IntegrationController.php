@@ -136,7 +136,7 @@ class IntegrationController extends Controller
         $byHostname = Server::where('active', true)->pluck('id', 'hostname')->mapWithKeys(fn ($sid, $h) => [strtolower($h) => $sid]);
 
         return response()->json(['success' => true, 'data' => collect($devices)->map(fn ($d) => [
-            'id' => $d['id'], 'name' => $d['name'], 'status' => $d['status'], 'plans' => $d['plans'],
+            'id' => $d['id'], 'name' => $d['name'], 'kind' => $d['kind'], 'status' => $d['status'], 'plans' => $d['plans'],
             'last_success_at' => $d['last_success_at']?->toIso8601ZuluString(), 'linked_server_id' => $linked[$d['id']] ?? null,
             // For the import dialog: does it have a plan, what would the server be called, and is that name already taken.
             'protected' => IntegrationImport::isProtected($d),
@@ -144,7 +144,7 @@ class IntegrationController extends Controller
             'matches_server_id' => $h ? ($byHostname[strtolower($h)] ?? null) : null, 'workload' => false,
         ])->merge($workloads->map(fn ($d) => [
             'id' => $d['id'], 'name' => $d['name'].' (all items)', 'status' => $d['status'], 'plans' => $d['plans'], 'last_success_at' => $d['last_success_at']?->toIso8601ZuluString(),
-            'linked_server_id' => $linked[$d['id']] ?? null, 'protected' => false, 'suggested_hostname' => null, 'matches_server_id' => null, 'workload' => true,
+            'linked_server_id' => $linked[$d['id']] ?? null, 'protected' => false, 'suggested_hostname' => null, 'matches_server_id' => null, 'workload' => true, 'kind' => 'workload',
         ]))->sortBy('name')->values()]);
     }
 
@@ -191,7 +191,10 @@ class IntegrationController extends Controller
         $link = DB::transaction(function () use ($id, $b, $request) {
             $server = $this->server($id);
             $integration = $this->find($b['integration_id']);
-            if (ServerLink::where('server_id', $server->id)->where('integration_id', $integration->id)->exists()) {
+            // A server has one device on a connection, or any number of Microsoft 365 workloads (mailboxes, OneDrive, Teams, SharePoint), never both.
+            $here = ServerLink::where('server_id', $server->id)->where('integration_id', $integration->id)->pluck('external_id');
+            $workload = PlatformWorkloads::isWorkloadId($b['external_id']);
+            if ($here->contains($b['external_id']) || ($here->isNotEmpty() && ! ($workload && $here->every(fn ($e) => PlatformWorkloads::isWorkloadId($e))))) {
                 throw ApiException::conflict('LINK_001', 'This server is already linked to a device on that connection. Remove the link first.');
             }
             if ($other = ServerLink::where('integration_id', $integration->id)->where('external_id', $b['external_id'])->first()) {

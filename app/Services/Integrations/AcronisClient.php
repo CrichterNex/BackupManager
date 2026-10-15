@@ -126,17 +126,24 @@ final class AcronisClient
      * Every machine the API client can see, in BMS's own shape. Only policies whose type mentions "backup" count
      * towards backup times, so an antimalware or patch run is never mistaken for a backup.
      *
-     * @return list<array{id: string, name: string, external_id: ?string, status: ?string, plans: list<string>, last_run_at: ?CarbonImmutable, last_success_at: ?CarbonImmutable}>
+     * Machines with an agent, and virtual machines the hypervisor integration protects without one (kind "vm"). A hypervisor host, a group and anything
+     * else Acronis lists are not backup targets and are left out. Machines come first, so when a VM has the same name as a machine (an agent installed inside
+     * it) the machine is the one that is imported.
+     *
+     * @return list<array{id: string, name: string, kind: string, external_id: ?string, status: ?string, plans: list<string>, last_run_at: ?CarbonImmutable, last_success_at: ?CarbonImmutable}>
      */
     public function listMachines(): array
     {
         $out = [];
         $after = null;
         for ($page = 0; $page < self::MAX_PAGES; $page++) {
-            $body = $this->get('/resource_management/v4/resource_statuses', array_filter(['type' => 'resource.machine', 'after' => $after]));
+            $body = $this->get('/resource_management/v4/resource_statuses', array_filter(['limit' => 200, 'after' => $after]));
             foreach ($body['items'] ?? [] as $item) {
                 $ctx = $item['context'] ?? [];
-                if (! isset($ctx['id'])) {
+                $type = (string) ($ctx['type'] ?? '');
+                $isVm = str_starts_with($type, 'resource.virtual_machine.');
+                // An item that names no type is read as a machine, as the platform's own machine list always did.
+                if (! isset($ctx['id']) || ($type !== '' && $type !== 'resource.machine' && ! $isVm)) {
                     continue;
                 }
                 $runs = $successes = [];
@@ -150,7 +157,7 @@ final class AcronisClient
                 $latest = fn (array $times) => collect($times)->filter()->sortDesc()->first();
                 $plans = $item['aggregate']['names'] ?? [];
                 $out[] = [
-                    'id' => (string) $ctx['id'],
+                    'id' => (string) $ctx['id'], 'kind' => $isVm ? 'vm' : 'machine',
                     'name' => (string) ($ctx['user_defined_name'] ?? $ctx['name'] ?? $ctx['id']),
                     'external_id' => isset($ctx['external_id']) ? (string) $ctx['external_id'] : null,
                     'status' => isset($item['aggregate']['status']) ? (string) $item['aggregate']['status'] : null,
@@ -164,6 +171,7 @@ final class AcronisClient
                 break;
             }
         }
+        usort($out, fn ($a, $b) => $a['kind'] <=> $b['kind']);   // "machine" before "vm"; the sort keeps the rest of the order
 
         return $out;
     }

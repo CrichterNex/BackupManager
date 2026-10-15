@@ -64,6 +64,15 @@ selected company admins two extra abilities from **Companies** in the UI (`/api/
   - The switch is a header (`X-Acting-Company`) the UI sends per browser tab. Anyone who is not a platform admin
     sending it gets 403, and an unknown company gets 404. It is never ignored.
 
+### One dashboard for every company
+**All companies** (under Platform) shows each active company on one page, those that need attention first: health score, servers and how many
+are failing, backups and tests over 30 days, open backup problems and test failures, tests waiting to be done, connections that have stopped
+syncing, and when the last backup finished. A company is flagged, with the reasons, when a server is failing, a serious failure is open, its health
+score is under 80, it has servers but no backup in 30 days, or a platform connection is not syncing. `GET /api/platform/dashboard`.
+
+It gives counts only, like the rest of the platform area: never a server name, a failure's text or anything else from inside a company. To look
+closer, open the company; each visit is written to that company's audit trail.
+
 ### Users, and access to other companies
 
 - **Editing people.** On **Users**, a company admin can edit a person's name, email, phone and role, reset their
@@ -169,8 +178,9 @@ Not every company has every backup solution, so tests can be limited per company
 A Microsoft 365 tenant is not a machine, so it is stored as a server of type **Microsoft 365 tenant**: no IP address, no agent, and
 only the Acronis Microsoft 365 or Microsoft native 365 backup methods. Its jobs, schedules, tests and reports work like any other.
 It carries a list of **mailboxes or sites to sample** (one per line). Each test by hand picks the one tested least recently.
-BMS does not yet read Microsoft 365 backup status from Acronis (the sync only reads machines), so the job's status is not updated
-automatically; the Recovery point check and tests by hand are what cover it today.
+Backup status for the tenant comes from the Acronis connection that holds it (see "Microsoft 365 backups in Acronis"), once a server is linked to a workload.
+Starting a test by hand needs no backup job: use **Test by hand** on the server page. If the server has no job, BMS makes a stand-in job that never ran, which is not counted as a backup in reports or statistics.
+Four tests are done by hand for Microsoft 365: the mailbox item (below), **OneDrive file**, **SharePoint site** and **Microsoft Teams message**. All four are set up the same way: BMS picks the mailbox, OneDrive, site or team at random from what Acronis has backed up, and names the item to restore ("the 3rd file last changed on Wednesday 7 October", or for Teams "the 3rd message posted on that day in the General channel", counting from the earliest that day). The tester records the item and recovery point in fields BMS checks (not a later day or position than asked, not newer than the recovery point, recovery point recent, the file opens, and for SharePoint its permissions came back) and attaches screenshots; without those it cannot pass. None can be automated today: what Acronis's records show is that a backup ran, not that anything restores.
 
 ### Testing a Microsoft 365 mailbox by hand
 The test is: restore an item chosen at random, and confirm it is complete and opens. Nobody reads a real person's mail and nobody
@@ -365,7 +375,7 @@ Microsoft 365 backups are not devices. Acronis logs one backup per mailbox, OneD
 
 * A workload is **failed** when at least `BMS_WORKLOAD_FAILED_PERCENT` (5) of its items failed in their latest backup, or none succeeded. That raises a problem to review, with the error codes. A few failed items below that are shown in the summary and the server page (by name, with the error) but do not fail the workload, because in thousands of items some always fail, a deleted site for one. A cancelled backup is not a failure.
 * It is a **warning** (raised as overdue) when nothing in it has been backed up for the connection's stale hours.
-* Only items whose latest backup finished within `BMS_WORKLOAD_WINDOW_DAYS` (7) are counted. A mailbox is named only while its latest backup has a problem.
+* Only items whose latest backup finished within `BMS_WORKLOAD_WINDOW_DAYS` (7) are counted. Each item's name (a mailbox address, a site) is kept so a test can be picked from what was really backed up, and so a failed item can be named.
 * The first read of a connection starts `BMS_ACTIVITY_LOOKBACK_DAYS` (7) back and takes several syncs on a busy tenant. While it catches up the page says so, and an old last backup is not judged.
 * This shows Acronis ran the backups and how they ended. It does not show an item restores: keep the manual mailbox restore test. Needs the engine (`php artisan schedule:work`) running.
 
@@ -400,11 +410,70 @@ Backups page and counted on the dashboard.
 - **Needs the engine.** The Acronis sync only runs while `php artisan schedule:work` (or the cron entry) runs. If it is not running, the
   data ages, and devices will look overdue because nothing has refreshed them.
 
+## Mail reminders
+Under **Mail reminders** (admins) BMS sends a daily mail to the people who have something to fix or do: backup problems and test failures nobody
+has dealt with, tests waiting to be done by hand, tests waiting for a second person to check, servers not tested for 30 days, and platform
+connections that have stopped syncing. Each list shows the worst first, how long it has waited, and links to the page in BMS.
+
+- **Who.** Admins get all of it. A technician gets only the tests assigned to them or waiting on their servers. Managers get the admin digest only
+  if the company turns that on. Anyone can turn their own off under **My profile**, and can send themselves one on the spot.
+- **When.** In the hour the company chooses, in the company's own time zone, weekdays only unless changed. The engine checks every minute and each
+  person gets at most one a day. If there is nothing to say, nothing is sent.
+- **If mail is down** the failure is recorded on the page and not tried again that day, so a broken mail server is not hit every minute.
+- **Mail has to be set up on the server.** Out of the box BMS writes mail to its log (`MAIL_MAILER=log`) and delivers nothing; the page says so.
+  To deliver, set `MAIL_MAILER`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_FROM_ADDRESS` and `APP_URL` in `.env` (the links in
+  the mail use `APP_URL`), then use **Send me one now**. Those details are entered on the server, never in BMS.
+- `php artisan bms:send-reminders` runs the same check by hand.
+
 ## Reports
 
 Four reports under **Reports** (admins and managers): compliance, SLA performance, security and access, and DR
-readiness. Each is saved as a frozen snapshot. `GET /api/reports/:id/view` is a print-ready page; use the browser's
-Print, then Save as PDF. Last month's compliance report and last quarter's SLA report are archived automatically.
+readiness. Each is saved as a frozen snapshot. `GET /api/reports/:id/view` is a print-ready page and
+`GET /api/reports/:id/pdf` downloads it as a PDF (made by the dompdf library; the file carries no author, creator,
+producer, dates or title). Last month's compliance report and last quarter's SLA report are archived automatically.
+
+### Scheduled reports
+On the Reports page, **Schedule a report** makes a report on a timetable: weekly, monthly, quarterly or a custom cron (at most once a day), at a
+time and in a time zone you choose, covering the previous week, month or quarter or the last 30 or 90 days (DR readiness is a snapshot of when it
+runs). Each run saves a report like any other, so it can be opened, downloaded as a PDF or anonymised, and admins are notified when it is ready.
+**Run now** makes one straight away without moving the timetable. If BMS was off at the time, one report is made when it is back, not one for each
+time missed. Periods are in UTC. Last month's compliance and last quarter's SLA reports are still archived automatically as before.
+
+### What each report lists for a server
+The compliance, SLA and DR readiness reports list every active server with: what it stores, **backup frequency**,
+**retention**, last backup, last test and **who performed the last test**.
+
+- **What it stores** is a field on the server ("Finance database", "HR file shares"). It is required in the server form
+  and shown on reports; the API leaves it optional so existing servers keep working, and a report says "Not stated".
+- **Backup frequency** is the job's schedule (daily, weekly, monthly, every N hours). A job with no schedule gets its
+  frequency from the gaps between its last successful backups and is marked "(observed)", since that is a guess. Fewer
+  than three successful backups gives "Not known". Microsoft 365 backups are timed in the platform: "Set in the backup
+  platform".
+- **Retention** is the server's retention policy, otherwise the jobs' own, otherwise "Not set".
+- **Test performed by** is the person's name for a test done by hand and "System (automatic)" for one BMS ran. The last
+  test is the latest passed or failed one finished by the end of the period (skipped and cancelled do not count).
+- These are worked out when the report is generated, so an old report keeps saying what was true then. A report made
+  before these columns existed shows "Not recorded".
+
+### An agent on a machine with no Python
+The Python agent is the normal way. For a Linux machine that has no Python and cannot install one (a NAS, for example) the same agent can be bundled
+with its own portable Python, built on request, and BMS offers it on the Agents page once one has been put in `storage/app/agent-bundles`. How to make
+and use one, and what is known about a Netgear ReadyNAS, is in `agent/README.md`, which also explains backing up to an SMB share from Linux (mount it first, then use the mounted folder as the location).
+
+### Anonymised reports
+Add `?anonymise=1` to the view or PDF, or tick **Anonymise** on the Reports page, to send a report outside the company.
+It is made when you ask for it, from the saved snapshot, so the same report can be had both ways.
+
+- The company is withheld. A server is shown **only by what it stores**; servers that do the same thing are numbered
+  ("HR file shares (1)", "(2)"), and one with no function filled in is "Server 1 (function not stated)".
+- A person is "Technician 1", "Technician 2". "System (automatic)" stays as it is.
+- What a server backs up (the folders and paths) is left out, along with names, addresses and the report's own number.
+- Rows are put in the order of the label, so the order does not give the server names away. The file name
+  (`bms-<type>-<id>-anonymised.pdf`) names no one.
+- Dates, counts and results stay, since they are the report. Anonymising does not hide what you type into the "stores"
+  field, so describe the function and do not put a name or the company in it. A function shared by only one server in
+  a small company can still point to it.
+- Every PDF and every anonymised export is written to the audit trail.
 
 - **Only recorded data.** Anything BMS cannot measure (uptime, RTO and RPO actuals, encryption, storage use, service
   credits, framework attestations, DR documentation) is not filled in. Each report ends with a "Not measured by BMS"
